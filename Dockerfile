@@ -17,6 +17,7 @@ ENV RPC=http://127.0.0.1:8545 \
     MAX_LAG=100 \
     TRACE_TIMEOUT=60s \
     INCLUDE_RECEIPTS=true \
-    PROM_FILE=""
+    PROM_FILE="" \
+    CHAIN=mainnet
 
 CMD ["node", "index.js"]

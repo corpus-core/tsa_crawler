@@ -28,7 +28,10 @@ services:
       MAX_LAG: "100"                  # < 128 (Full-Node-State-Fenster)
       TRACE_TIMEOUT: "60s"           # gilt pro Tx
       INCLUDE_RECEIPTS: "true"
-      PROM_FILE: "/metrics/trace_collector.prom"   # read by node_exporter textfile_collector
+      CHAIN: "mainnet"               # label on all metrics; also part of the prom filename
+      # One file PER chain: two collectors writing the same file would overwrite
+      # each other. The chain label keeps the series apart in Prometheus.
+      PROM_FILE: "/metrics/trace_collector_mainnet.prom"
 
     volumes:
       # Ziel auf der frisch aufgeraeumten grossen Platte.

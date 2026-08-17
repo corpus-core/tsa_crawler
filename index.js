@@ -27,6 +27,7 @@ const MAX_LAG          = parseInt(process.env.MAX_LAG || '100', 10); // < 128 (F
 const TRACE_TIMEOUT    = process.env.TRACE_TIMEOUT || '60s';         // gilt PRO Tx
 const INCLUDE_RECEIPTS = (process.env.INCLUDE_RECEIPTS || 'true') !== 'false';
 const PROM_FILE        = process.env.PROM_FILE || '';  // e.g. /metrics/trace_collector.prom ('' = disabled)
+const CHAIN            = process.env.CHAIN || 'mainnet';  // metric label to tell multiple chains apart
 const STATE            = path.join(OUT, '.state.json');
 const EMPTY_CODE_HASH  = '0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470';
 
@@ -129,18 +130,24 @@ function totalOutputFiles(){
   return sum;
 }
 
+// Escape a label value per Prometheus exposition format (backslash, quote, newline).
+function escapeLabel(v){
+  return String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+}
+const LABELS = `{chain="${escapeLabel(CHAIN)}"}`;
+
 function writeMetrics(lastBlock){
   if (!PROM_FILE) return;
   const lines = [
     '# HELP trace_collector_traced_transactions_total Transactions traced and saved since process start.',
     '# TYPE trace_collector_traced_transactions_total counter',
-    `trace_collector_traced_transactions_total ${tracedTotal}`,
+    `trace_collector_traced_transactions_total${LABELS} ${tracedTotal}`,
     '# HELP trace_collector_output_files Total trace files (<bucket>/<txhash>.json) in the OUT directory.',
     '# TYPE trace_collector_output_files gauge',
-    `trace_collector_output_files ${totalOutputFiles()}`,
+    `trace_collector_output_files${LABELS} ${totalOutputFiles()}`,
     '# HELP trace_collector_last_processed_block Last block number processed by the collector.',
     '# TYPE trace_collector_last_processed_block gauge',
-    `trace_collector_last_processed_block ${lastBlock == null ? 0 : lastBlock}`,
+    `trace_collector_last_processed_block${LABELS} ${lastBlock == null ? 0 : lastBlock}`,
     ''  // exposition format requires a trailing newline
   ];
   try {

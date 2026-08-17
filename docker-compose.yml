@@ -1,0 +1,45 @@
+x-logging: &logging
+  logging:
+    driver: loki
+    options:
+      loki-url: "http://193.26.158.2:3100/loki/api/v1/push"
+      loki-batch-size: "400"
+      loki-external-labels: "chain=mainnet,type=trace-collector"
+
+services:
+  collector:
+    build: .
+    image: colibri/trace-collector:latest
+    container_name: trace-collector
+    restart: unless-stopped
+
+    # geth laeuft auf diesem Host im host-mode (RPC lokal auf 127.0.0.1:8545).
+    # Der Collector deshalb ebenfalls host-mode: erreicht localhost:8545 direkt und
+    # umgeht die Bridge-/ufw-Problematik (eine Bridge-IP waere nicht in der Allowlist).
+    network_mode: host
+
+    <<: *logging
+
+    environment:
+      RPC: "http://127.0.0.1:8545"   # geth mit eth + debug Namespace, Full-Node im Fenster
+      OUT: "/data/traces"
+      CAP: "5"
+      POLL_MS: "12000"
+      MAX_LAG: "100"                  # < 128 (Full-Node-State-Fenster)
+      TRACE_TIMEOUT: "60s"           # gilt pro Tx
+      INCLUDE_RECEIPTS: "true"
+      PROM_FILE: "/metrics/trace_collector.prom"   # read by node_exporter textfile_collector
+
+    volumes:
+      # Ziel auf der frisch aufgeraeumten grossen Platte.
+      # Einmalig anlegen + Owner setzen (Container laeuft als uid 1000):
+      #   sudo mkdir -p /srv/trace-data && sudo chown -R 1000:1000 /srv/trace-data
+      - /srv/trace-data:/data/traces
+      # node_exporter textfile_collector directory (host path must match the
+      # --collector.textfile.directory flag of node_exporter). The container
+      # runs as uid 1000, so the directory must be writable for it:
+      #   sudo mkdir -p /srv/node_exporter/textfile && sudo chown 1000:1000 /srv/node_exporter/textfile
+      - /srv/node_exporter/textfile:/metrics
+
+    # Container selbst ist leichtgewichtig – die Trace-Last traegt geth, nicht dieser Prozess.
+    mem_limit: 512m

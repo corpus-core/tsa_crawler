@@ -81,7 +81,7 @@ export function stripAccessListForSim(list) {
  * @param {(method:string, params:any[]) => Promise<any>} opts.rpc
  * @param {string|number} [opts.blockTag]            Block used for proofs (default 'latest')
  * @param {Map<string,string>} [opts.codeHashCache]  addr -> codeHash, survives calls
- * @param {Map<string,string>} [opts.codeCache]      codeHash -> code, content-addressed
+ * @param {Map<string,object|null>} [opts.codeCache] codeHash -> minimal-proxy hit (never raw bytecode)
  * @param {boolean} [opts.fetchCode]                 eth_getCode for EIP-1167/7702
  * @param {number} [opts.maxDepth]                   Proxy chain depth (default 3)
  * @param {string[]} [opts.addresses]                extra accounts to include (no invented slots)
@@ -178,22 +178,18 @@ export async function sloadsToAccessList(sloads, opts) {
         }
 
         if (!implSlot && opts.fetchCode) {
-            let code = codeCache.get(codeHash);
-            if (code === undefined) {
+            let hit = codeCache.get(codeHash);
+            if (hit === undefined) {
                 try {
-                    code = await rpc('eth_getCode', [addr, blockTag]);
-                    codeCache.set(codeHash, code);
+                    hit = detectMinimalProxy(await rpc('eth_getCode', [addr, blockTag]));
                 } catch {
-                    code = '0x';
+                    hit = null;
                 }
+                codeCache.set(codeHash, hit);
             }
-            const c = String(code || '0x').toLowerCase();
-            if (c.startsWith('0xef0100') && c.length === 2 + 46) {
-                target = '0x' + c.slice(8);
-                kind = 'eip7702';
-            } else if (c.startsWith('0x363d3d373d3d3d363d73') && c.endsWith('5af43d82803e903d91602b57fd5bf3')) {
-                target = '0x' + c.slice(22, 62);
-                kind = 'eip1167';
+            if (hit) {
+                target = hit.target;
+                kind = hit.kind;
             }
         }
 
@@ -240,4 +236,22 @@ export async function sloadsToAccessList(sloads, opts) {
         codeHash: e.codeHash,
         ...(e.implementation ? { implementation: e.implementation, proxyKind: e.proxyKind } : {}),
     }));
+}
+
+/**
+ * EIP-1167 / EIP-7702 only. Full bytecode is never cached — on a long-running
+ * collector that would retain every unique contract in RAM.
+ *
+ * @param {string|null|undefined} code
+ * @return {{kind:string, target:string}|null}
+ */
+export function detectMinimalProxy(code) {
+    const c = String(code || '0x').toLowerCase();
+    if (c.startsWith('0xef0100') && c.length === 2 + 46) {
+        return { kind: 'eip7702', target: '0x' + c.slice(8) };
+    }
+    if (c.startsWith('0x363d3d373d3d3d363d73') && c.endsWith('5af43d82803e903d91602b57fd5bf3')) {
+        return { kind: 'eip1167', target: '0x' + c.slice(22, 62) };
+    }
+    return null;
 }

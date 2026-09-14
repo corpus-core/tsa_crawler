@@ -5,6 +5,7 @@ import {
     pad32,
     collectTraceSlots,
     stripAccessListForSim,
+    detectMinimalProxy,
     EMPTY_CODE_HASH,
 } from '../proxy_accesslist.mjs';
 
@@ -108,6 +109,26 @@ describe('sloadsToAccessList', () => {
         const proxy = list.find((e) => e.address === PROXY);
         assert.equal(proxy.proxyKind, 'eip1167');
         assert.equal(proxy.implementation, IMPL);
+        assert.deepEqual(detectMinimalProxy(MINIMAL_PROXY_CODE), { kind: 'eip1167', target: IMPL });
+        assert.equal(detectMinimalProxy('0x6080604052'), null);
+    });
+
+    it('caches a proxy hit, not raw bytecode', async () => {
+        const cloneHash = '0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc';
+        const codeCache = new Map();
+        const rpc = mockRpc({
+            eth_getProof: (params) => {
+                if (params[0] === PROXY) return { codeHash: cloneHash };
+                if (params[0] === IMPL) return { codeHash: IMPL_HASH };
+                throw new Error('unexpected addr');
+            },
+            eth_getCode: MINIMAL_PROXY_CODE,
+        });
+        await sloadsToAccessList(
+            [{ addr: PROXY, slot: '0x0', value: pad32('0x1') }],
+            { rpc, blockTag: '0x10', fetchCode: true, codeCache },
+        );
+        assert.deepEqual(codeCache.get(cloneHash), { kind: 'eip1167', target: IMPL });
     });
 
     it('includes extra addresses without inventing a storage key', async () => {

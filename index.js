@@ -250,7 +250,9 @@ function rebuildCounts() {
 // Written for node_exporter's textfile_collector: the file must be complete
 // valid exposition format, so we write to a .tmp file and rename atomically.
 // node_exporter only picks up *.prom files, the .tmp is ignored.
-let tracedTotal = 0;   // traces saved since process start (counter, resets on restart)
+let tracedTotal = 0;     // traces saved since process start (counter, resets on restart)
+let seenTxTotal = 0;     // all txs in processed blocks since process start
+let selectedTxTotal = 0; // txs selected for tracing since process start
 
 function totalOutputFiles() {
   let sum = 0;
@@ -270,9 +272,18 @@ function writeMetrics(lastBlock) {
     '# HELP trace_collector_traced_transactions_total Transactions traced and saved since process start.',
     '# TYPE trace_collector_traced_transactions_total counter',
     `trace_collector_traced_transactions_total${LABELS} ${tracedTotal}`,
+    '# HELP trace_collector_transactions_total Transactions seen in processed blocks since process start.',
+    '# TYPE trace_collector_transactions_total counter',
+    `trace_collector_transactions_total${LABELS} ${seenTxTotal}`,
+    '# HELP trace_collector_selected_transactions_total Transactions selected for tracing since process start.',
+    '# TYPE trace_collector_selected_transactions_total counter',
+    `trace_collector_selected_transactions_total${LABELS} ${selectedTxTotal}`,
     '# HELP trace_collector_output_files Total trace files (<bucket>/<txhash>.json) in the OUT directory.',
     '# TYPE trace_collector_output_files gauge',
     `trace_collector_output_files${LABELS} ${totalOutputFiles()}`,
+    '# HELP trace_collector_buckets Distinct codehash_selector buckets currently tracked.',
+    '# TYPE trace_collector_buckets gauge',
+    `trace_collector_buckets${LABELS} ${counts ? counts.size : 0}`,
     '# HELP trace_collector_last_processed_block Last block number processed by the collector.',
     '# TYPE trace_collector_last_processed_block gauge',
     `trace_collector_last_processed_block${LABELS} ${lastBlock == null ? 0 : lastBlock}`,
@@ -300,6 +311,7 @@ async function processBlock(n) {
   const block = await rpc('eth_getBlockByNumber', [hex, true]);
   if (!block || !block.transactions) return;
   const txs = block.transactions;
+  seenTxTotal += txs.length;
 
   // ---- Phase 1: Selektion (ohne Tracing) ----
   const selected = [];
@@ -319,6 +331,7 @@ async function processBlock(n) {
     selected.push({ tx, idx: i, bucket, file, selector, codehash });
   }
 
+  selectedTxTotal += selected.length;
   if (selected.length === 0) {
     console.log(`block ${n}: ${txs.length} tx, 0 selektiert (cache=${codeHashCache.size})`);
     return;

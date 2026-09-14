@@ -135,10 +135,10 @@ async function rpc(method, params) {
     return j.result;
 }
 
-function writeAtomic(file, obj) {
+function writeAtomic(file, obj, pretty = false) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const tmp = file + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n');
+    fs.writeFileSync(tmp, (pretty ? JSON.stringify(obj, null, 2) : JSON.stringify(obj)) + '\n');
     fs.renameSync(tmp, file);
 }
 
@@ -294,7 +294,7 @@ async function step2(traceFile, explainer) {
             style: 'detailed',
             ...explainer.buildPrompt(sim, txParams, { systemPrompt: DETAILED_SYSTEM_PROMPT }, context),
         },
-    ]);
+    ], true);
     return 'ok';
 }
 

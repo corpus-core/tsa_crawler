@@ -3,7 +3,7 @@ FROM node:22-alpine
 # Der Collector nutzt ausschliesslich Node-Builtins (fs, path) + globales fetch.
 # Kein npm install, kein package.json noetig.
 WORKDIR /app
-COPY index.js ./
+COPY index.js proxy_accesslist.mjs ./
 
 # Als non-root laufen (User 'node', uid 1000, existiert im Image).
 # Das gemountete Ziel-Verzeichnis muss daher uid 1000 gehoeren (siehe compose-Kommentar).

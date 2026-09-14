@@ -1,0 +1,38 @@
+FROM node:22-alpine
+
+# Prepare needs git only at build time (sparse checkout of the explainer).
+RUN apk add --no-cache git ca-certificates
+
+# Unreleased explainer lives in the colibri monorepo, not on npm yet.
+# Sparse checkout avoids pulling the C tree. COLIBRI_REF is a branch or tag.
+ARG COLIBRI_REPO=https://github.com/corpus-core/colibri-stateless.git
+ARG COLIBRI_REF=dev
+
+RUN git clone --depth 1 --filter=blob:none --sparse --branch "${COLIBRI_REF}" "${COLIBRI_REPO}" /tmp/colibri \
+    && git -C /tmp/colibri sparse-checkout set bindings/emscripten/packages/explainer \
+    && mkdir -p /opt \
+    && mv /tmp/colibri/bindings/emscripten/packages/explainer /opt/explainer \
+    && rm -rf /tmp/colibri \
+    && cd /opt/explainer \
+    && npm ci --omit=optional \
+    && npm run build \
+    && npm prune --omit=dev --omit=optional
+
+WORKDIR /app
+COPY prepare-testdata.mjs sim-from-trace.mjs proxy_accesslist.mjs ./
+
+USER node
+
+ENV EXPLAINER_DIR=/opt/explainer \
+    SKIP_EXPLAINER_BUILD=1 \
+    IN=/data/traces \
+    C4_STATE_DIR=/data/cache \
+    RPC=https://mainnet1.colibri-proof.tech/execution \
+    CHAIN_ID=1 \
+    STEPS=1,2 \
+    CONCURRENCY=2 \
+    INTERVAL_S=300 \
+    PROGRESS_EVERY=100 \
+    NODE_OPTIONS=--max-old-space-size=3072
+
+CMD ["node", "prepare-testdata.mjs"]

@@ -1,0 +1,29 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch Program",
+            "program": "${workspaceFolder}/prepare-testdata.mjs",
+            "request": "launch",
+            "skipFiles": [
+                "<node_internals>/**"
+            ],
+            "args": [
+                "--max-old-space-size=8192"
+            ],
+            "type": "node",
+            "env": {
+                "RPC": "https://mainnet1.colibri-proof.tech/execution",
+                "CHAIN_ID": "1",
+                "STEPS": "1,2",
+                "CONCURRENCY": "1",
+                "IN": "${workspaceFolder}/test_data",
+                "PROGRESS_EVERY": "10",
+                "C4_STATE_DIR": "${workspaceFolder}/sol_cache"
+            }
+        },
+    ]
+}

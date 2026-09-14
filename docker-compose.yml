@@ -21,14 +21,14 @@ services:
     <<: *logging
 
     environment:
-      RPC: "http://127.0.0.1:8545"   # geth mit eth + debug Namespace, Full-Node im Fenster
+      RPC: "http://127.0.0.1:8545" # geth mit eth + debug Namespace, Full-Node im Fenster
       OUT: "/data/traces"
       CAP: "5"
       POLL_MS: "12000"
-      MAX_LAG: "100"                  # < 128 (Full-Node-State-Fenster)
-      TRACE_TIMEOUT: "60s"           # gilt pro Tx
+      MAX_LAG: "100" # < 128 (Full-Node-State-Fenster)
+      TRACE_TIMEOUT: "60s" # gilt pro Tx
       INCLUDE_RECEIPTS: "true"
-      CHAIN: "mainnet"               # label on all metrics; also part of the prom filename
+      CHAIN: "mainnet" # label on all metrics; also part of the prom filename
       # One file PER chain: two collectors writing the same file would overwrite
       # each other. The chain label keeps the series apart in Prometheus.
       PROM_FILE: "/metrics/trace_collector_mainnet.prom"
@@ -46,3 +46,49 @@ services:
 
     # Container selbst ist leichtgewichtig – die Trace-Last traegt geth, nicht dieser Prozess.
     mem_limit: 512m
+
+  # Batch-Aufbereitung: _sim.json + _prompt.json aus den Collector-Traces.
+  # Eigenes Image: git/npm/solc + Sourcify. Nicht in den Collector mischen
+  # (anderer Lifecycle, mehr RAM, braucht ausgehendes HTTPS).
+  prepare:
+    build:
+      context: .
+      dockerfile: Dockerfile.prepare
+      args:
+        # Branch/Tag von https://github.com/corpus-core/colibri-stateless
+        # (Explainer ist noch nicht auf npm. Lokale uncommittete Aenderungen
+        # sind erst nach Push auf diesen Ref im Image.)
+        COLIBRI_REF: dev
+    image: colibri/trace-prepare:latest
+    container_name: trace-prepare
+    restart: unless-stopped
+
+    # Sourcify + colibri-RPC brauchen ausgehendes HTTPS; Bridge reicht.
+    # network_mode: host nur, wenn RPC auf 127.0.0.1:8545 zeigen soll.
+
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://193.26.158.2:3100/loki/api/v1/push"
+        loki-batch-size: "400"
+        loki-external-labels: "chain=mainnet,type=trace-prepare"
+
+    environment:
+      IN: "/data/traces"
+      C4_STATE_DIR: "/data/cache"
+      RPC: "https://mainnet1.colibri-proof.tech/execution"
+      CHAIN_ID: "1"
+      STEPS: "1,2"
+      CONCURRENCY: "2"
+      INTERVAL_S: "300"
+      EXPLAINER_DIR: "/opt/explainer"
+      SKIP_EXPLAINER_BUILD: "1"
+      NODE_OPTIONS: "--max-old-space-size=3072"
+
+    volumes:
+      - /srv/trace-data:/data/traces
+      # Sourcify/solc-Cache; einmalig:
+      #   sudo mkdir -p /srv/trace-cache && sudo chown 1000:1000 /srv/trace-cache
+      - /srv/trace-cache:/data/cache
+
+    mem_limit: 4g

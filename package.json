@@ -1,0 +1,8 @@
+{
+    "name": "tsa_crawler",
+    "private": true,
+    "scripts": {
+        "prepare-testdata": "node prepare-testdata.mjs",
+        "test": "node --test test/*.test.mjs"
+    }
+}

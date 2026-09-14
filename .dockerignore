@@ -1,0 +1,6 @@
+.git
+test_data
+sol_cache
+traces
+node_modules
+**/.DS_Store

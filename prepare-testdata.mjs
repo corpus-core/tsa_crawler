@@ -19,7 +19,7 @@ const STEPS = (process.env.STEPS || '1,2').split(',').map((s) => s.trim()).filte
 const CONCURRENCY = parseInt(process.env.CONCURRENCY || '4', 10);
 const FORCE = process.env.FORCE === '1';
 const PROGRESS_EVERY = parseInt(process.env.PROGRESS_EVERY || '100', 10);
-const INTERVAL_S = parseInt(process.env.INTERVAL_S || '0', 10);
+const INTERVAL_S = parseInt(process.env.INTERVAL_S || '0', 3600);
 const SKIP_EXPLAINER_BUILD = process.env.SKIP_EXPLAINER_BUILD === '1';
 const EXPLAINER_DIR = process.env.EXPLAINER_DIR
     || path.resolve(__dirname, '../colibri-stateless/bindings/emscripten/packages/explainer');

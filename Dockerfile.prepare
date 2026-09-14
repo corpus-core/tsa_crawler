@@ -5,6 +5,8 @@ RUN apk add --no-cache git ca-certificates
 
 # Unreleased explainer lives in the colibri monorepo, not on npm yet.
 # Sparse checkout avoids pulling the C tree. COLIBRI_REF is a branch or tag.
+# @mlc-ai/web-llm is optional and unused here; tsc still typechecks the import,
+# so a stub module is enough. Do not `npm ci` the real package (large).
 ARG COLIBRI_REPO=https://github.com/corpus-core/colibri-stateless.git
 ARG COLIBRI_REF=dev
 
@@ -15,6 +17,9 @@ RUN git clone --depth 1 --filter=blob:none --sparse --branch "${COLIBRI_REF}" "$
     && rm -rf /tmp/colibri \
     && cd /opt/explainer \
     && npm ci --omit=optional \
+    && mkdir -p node_modules/@mlc-ai/web-llm \
+    && printf '%s\n' 'export {};' > node_modules/@mlc-ai/web-llm/index.d.ts \
+    && printf '%s\n' '{"name":"@mlc-ai/web-llm","version":"0.0.0","types":"index.d.ts"}' > node_modules/@mlc-ai/web-llm/package.json \
     && npm run build \
     && npm prune --omit=dev --omit=optional
 
@@ -33,6 +38,8 @@ ENV EXPLAINER_DIR=/opt/explainer \
     CONCURRENCY=2 \
     INTERVAL_S=300 \
     PROGRESS_EVERY=100 \
+    CHAIN=mainnet \
+    PROM_FILE="" \
     NODE_OPTIONS=--max-old-space-size=3072
 
 CMD ["node", "prepare-testdata.mjs"]

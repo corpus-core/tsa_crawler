@@ -19,12 +19,89 @@ const STEPS = (process.env.STEPS || '1,2').split(',').map((s) => s.trim()).filte
 const CONCURRENCY = parseInt(process.env.CONCURRENCY || '4', 10);
 const FORCE = process.env.FORCE === '1';
 const PROGRESS_EVERY = parseInt(process.env.PROGRESS_EVERY || '100', 10);
-const INTERVAL_S = parseInt(process.env.INTERVAL_S || '0', 3600);
+const INTERVAL_S = parseInt(process.env.INTERVAL_S || '0', 10);
 const SKIP_EXPLAINER_BUILD = process.env.SKIP_EXPLAINER_BUILD === '1';
 const EXPLAINER_DIR = process.env.EXPLAINER_DIR
     || path.resolve(__dirname, '../colibri-stateless/bindings/emscripten/packages/explainer');
+const PROM_FILE = process.env.PROM_FILE || '';
+const CHAIN = process.env.CHAIN || 'mainnet';
 const TRACE_FILE_RE = /^0x[0-9a-f]{64}\.json$/;
 if (!process.env.C4_STATE_DIR) process.env.C4_STATE_DIR = '.';
+
+// --------------------------- Prometheus-Metriken ---------------------------
+// Same textfile_collector pattern as index.js: complete exposition file,
+// write to .tmp and rename. Process counters reset on restart; gauges
+// reflect the current IN directory. Separate PROM_FILE from the collector.
+let simWrittenTotal = 0;
+let promptWrittenTotal = 0;
+let nosrcWrittenTotal = 0;
+let errorsTotal = 0;
+let lastRunTs = 0;
+let lastCounts = { traces: 0, sim: 0, prompt: 0, nosrc: 0 };
+
+function escapeLabel(v) {
+    return String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+}
+const LABELS = `{chain="${escapeLabel(CHAIN)}"}`;
+
+function snapshotCounts(traces) {
+    let sim = 0, prompt = 0, nosrc = 0;
+    for (const f of traces) {
+        if (fs.existsSync(simPath(f))) sim++;
+        if (fs.existsSync(promptPath(f))) prompt++;
+        else if (fs.existsSync(promptSkipPath(f))) nosrc++;
+    }
+    lastCounts = { traces: traces.length, sim, prompt, nosrc };
+}
+
+function writeMetrics() {
+    if (!PROM_FILE) return;
+    const pendingSim = Math.max(0, lastCounts.traces - lastCounts.sim);
+    const pendingPrompt = Math.max(0, lastCounts.sim - lastCounts.prompt - lastCounts.nosrc);
+    const lines = [
+        '# HELP trace_prepare_sim_files_total Simulation files written since process start.',
+        '# TYPE trace_prepare_sim_files_total counter',
+        `trace_prepare_sim_files_total${LABELS} ${simWrittenTotal}`,
+        '# HELP trace_prepare_prompt_files_total Prompt files written since process start.',
+        '# TYPE trace_prepare_prompt_files_total counter',
+        `trace_prepare_prompt_files_total${LABELS} ${promptWrittenTotal}`,
+        '# HELP trace_prepare_nosrc_total Sourcify-miss markers written since process start.',
+        '# TYPE trace_prepare_nosrc_total counter',
+        `trace_prepare_nosrc_total${LABELS} ${nosrcWrittenTotal}`,
+        '# HELP trace_prepare_errors_total Failed prepare steps since process start.',
+        '# TYPE trace_prepare_errors_total counter',
+        `trace_prepare_errors_total${LABELS} ${errorsTotal}`,
+        '# HELP trace_prepare_traces Trace files currently found under IN.',
+        '# TYPE trace_prepare_traces gauge',
+        `trace_prepare_traces${LABELS} ${lastCounts.traces}`,
+        '# HELP trace_prepare_sim_files Simulation files currently on disk.',
+        '# TYPE trace_prepare_sim_files gauge',
+        `trace_prepare_sim_files${LABELS} ${lastCounts.sim}`,
+        '# HELP trace_prepare_prompt_files Prompt files currently on disk.',
+        '# TYPE trace_prepare_prompt_files gauge',
+        `trace_prepare_prompt_files${LABELS} ${lastCounts.prompt}`,
+        '# HELP trace_prepare_nosrc_files Sourcify-miss markers currently on disk.',
+        '# TYPE trace_prepare_nosrc_files gauge',
+        `trace_prepare_nosrc_files${LABELS} ${lastCounts.nosrc}`,
+        '# HELP trace_prepare_pending_sim Traces still missing a _sim.json.',
+        '# TYPE trace_prepare_pending_sim gauge',
+        `trace_prepare_pending_sim${LABELS} ${pendingSim}`,
+        '# HELP trace_prepare_pending_prompt Sims still missing _prompt.json or _prompt.nosrc.',
+        '# TYPE trace_prepare_pending_prompt gauge',
+        `trace_prepare_pending_prompt${LABELS} ${pendingPrompt}`,
+        '# HELP trace_prepare_last_run_timestamp Unix time of the last completed prepare pass.',
+        '# TYPE trace_prepare_last_run_timestamp gauge',
+        `trace_prepare_last_run_timestamp${LABELS} ${lastRunTs}`,
+        '',
+    ];
+    try {
+        const tmp = PROM_FILE + '.tmp';
+        fs.writeFileSync(tmp, lines.join('\n'));
+        fs.renameSync(tmp, PROM_FILE);
+    } catch (e) {
+        console.error('metrics-error:', e.message);
+    }
+}
 
 /** System prompt for a technical walkthrough (replaces the explainer default). */
 const DETAILED_SYSTEM_PROMPT = `You are a senior Ethereum protocol engineer. Explain \
@@ -242,6 +319,8 @@ function sleep(ms) {
 async function runOnce(explainer) {
     const all = listTraceFiles(IN);
     console.log(`prepare-testdata: ${all.length} traces in ${IN} steps=${STEPS.join(',')} rpc=${RPC}`);
+    snapshotCounts(all);
+    writeMetrics();
 
     if (STEPS.includes('1')) {
         const files = missingOutput(all, simPath);
@@ -250,17 +329,26 @@ async function runOnce(explainer) {
         await mapLimit(files, CONCURRENCY, async (f) => {
             try {
                 const r = await step1(f);
-                if (r === 'skip') skip++; else ok++;
+                if (r === 'skip') skip++;
+                else {
+                    ok++;
+                    simWrittenTotal++;
+                    lastCounts.sim++;
+                }
             } catch (e) {
                 err++;
+                errorsTotal++;
                 console.error('step1', path.basename(f), e.message);
             }
             done++;
             if (done % PROGRESS_EVERY === 0) {
                 console.log(`step1: ${done}/${files.length} ok=${ok} err=${err}`);
+                writeMetrics();
             }
         });
         console.log(`step1: ${done}/${files.length} ok=${ok} skip=${skip} err=${err}`);
+        snapshotCounts(all);
+        writeMetrics();
     }
 
     if (STEPS.includes('2')) {
@@ -269,6 +357,9 @@ async function runOnce(explainer) {
         console.log(`step2: ${files.length} ohne _prompt.json/_prompt.nosrc (${withSim.length} haben _sim.json)`);
         if (!files.length) {
             console.log('step2: nichts zu tun');
+            lastRunTs = Math.floor(Date.now() / 1000);
+            snapshotCounts(all);
+            writeMetrics();
             return explainer;
         }
         if (!explainer) {
@@ -280,20 +371,34 @@ async function runOnce(explainer) {
             try {
                 const r = await step2(f, explainer);
                 if (r === 'skip') skip++;
-                else if (r === 'nosrc') nosrc++;
-                else if (r === 'err') err++;
-                else ok++;
+                else if (r === 'nosrc') {
+                    nosrc++;
+                    nosrcWrittenTotal++;
+                    lastCounts.nosrc++;
+                } else if (r === 'err') {
+                    err++;
+                    errorsTotal++;
+                } else {
+                    ok++;
+                    promptWrittenTotal++;
+                    lastCounts.prompt++;
+                }
             } catch (e) {
                 err++;
+                errorsTotal++;
                 console.error('step2', path.basename(f), e.message);
             }
             done++;
             if (done % PROGRESS_EVERY === 0) {
                 console.log(`step2: ${done}/${files.length} ok=${ok} nosrc=${nosrc} err=${err}`);
+                writeMetrics();
             }
         });
         console.log(`step2: ${done}/${files.length} ok=${ok} skip=${skip} nosrc=${nosrc} err=${err}`);
     }
+    lastRunTs = Math.floor(Date.now() / 1000);
+    snapshotCounts(all);
+    writeMetrics();
     return explainer;
 }
 

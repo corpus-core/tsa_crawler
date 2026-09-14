@@ -84,11 +84,15 @@ services:
       EXPLAINER_DIR: "/opt/explainer"
       SKIP_EXPLAINER_BUILD: "1"
       NODE_OPTIONS: "--max-old-space-size=3072"
+      CHAIN: "mainnet"
+      # Own file: collector and prepare must not share a .prom (last writer wins).
+      PROM_FILE: "/metrics/trace_prepare_mainnet.prom"
 
     volumes:
       - /srv/trace-data:/data/traces
       # Sourcify/solc-Cache; einmalig:
       #   sudo mkdir -p /srv/trace-cache && sudo chown 1000:1000 /srv/trace-cache
       - /srv/trace-cache:/data/cache
+      - /srv/node_exporter/textfile:/metrics
 
     mem_limit: 4g

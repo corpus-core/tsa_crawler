@@ -290,7 +290,7 @@ function writeMetrics(lastBlock) {
     ''  // exposition format requires a trailing newline
   ];
   try {
-    const tmp = PROM_FILE + '.tmp';   // same directory => rename stays atomic
+    const tmp = PROM_FILE + '.tmp';       // same directory => rename stays atomic
     fs.writeFileSync(tmp, lines.join('\n'));
     fs.renameSync(tmp, PROM_FILE);
   } catch (e) {

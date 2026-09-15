@@ -4,11 +4,11 @@
 // Forward-Streaming-Sammler fuer SLM-Trainingsdaten.
 // Alle POLL_MS pruefen, ob ein neuer Block da ist. Fuer jeden neuen Block:
 //   1) eth_getBlockByNumber(n, true)
-//   2) pro Tx: codehash der to-Adresse (gecacht) + selector -> bucket = codehash_selector
+//   2) pro Tx: codehash der to-Adresse (gecacht) + selector -> bucket
 //   3) Bucket voll (>= CAP)  -> ignorieren;  sonst -> tracen
 //      Adaptives Tracing: 1 selektierte Tx -> debug_traceTransaction,
 //                         >=2               -> debug_traceBlockByNumber (Block nur EINMAL ausfuehren)
-//   4) Ergebnis ablegen unter  OUT/<codehash>_<selector>/<txhash>.json
+//   4) Ergebnis ablegen unter  OUT/<hh>/<codehash[2:]>/<selector>/<txhash>.json
 //
 // Restart-sicher (State-Datei + Bucket-Counts aus dem FS rekonstruiert) und
 // Fenster-bewusst (traced nur innerhalb der ~128 Bloecke, die der Full-Node haelt).
@@ -203,12 +203,19 @@ const codeHashCache = new Map();
 const codeCache = new Map();
 let sloadsToAccessList;
 let collectTraceSlots;
+let bucketKey;
+let bucketRelPath;
+let countBuckets;
 
-async function loadAccessListModule() {
+async function loadSupportModules() {
   if (sloadsToAccessList) return;
-  const mod = await import(pathToFileURL(path.join(__dirname, 'proxy_accesslist.mjs')).href);
-  sloadsToAccessList = mod.sloadsToAccessList;
-  collectTraceSlots = mod.collectTraceSlots;
+  const access = await import(pathToFileURL(path.join(__dirname, 'proxy_accesslist.mjs')).href);
+  sloadsToAccessList = access.sloadsToAccessList;
+  collectTraceSlots = access.collectTraceSlots;
+  const paths = await import(pathToFileURL(path.join(__dirname, 'bucket_paths.mjs')).href);
+  bucketKey = paths.bucketKey;
+  bucketRelPath = paths.bucketRelPath;
+  countBuckets = paths.countBuckets;
 }
 
 async function getCodeHash(addr, blockHex) {
@@ -234,16 +241,7 @@ function saveState(n) { writeAtomic(STATE, { lastProcessed: n }); }
 
 // Bucket-Counts aus dem FS rekonstruieren -> CAP bleibt ueber Restarts korrekt.
 function rebuildCounts() {
-  const counts = new Map();
-  if (!fs.existsSync(OUT)) return counts;
-  for (const name of fs.readdirSync(OUT)) {
-    const dir = path.join(OUT, name);
-    let st; try { st = fs.statSync(dir); } catch { continue; }
-    if (!st.isDirectory()) continue;
-    const n = fs.readdirSync(dir).filter(f => /^0x[0-9a-f]{64}\.json$/.test(f)).length;
-    counts.set(name, n);
-  }
-  return counts;
+  return countBuckets(OUT);
 }
 
 // --------------------------- Prometheus-Metriken ---------------------------
@@ -278,7 +276,7 @@ function writeMetrics(lastBlock) {
     '# HELP trace_collector_selected_transactions_total Transactions selected for tracing since process start.',
     '# TYPE trace_collector_selected_transactions_total counter',
     `trace_collector_selected_transactions_total${LABELS} ${selectedTxTotal}`,
-    '# HELP trace_collector_output_files Total trace files (<bucket>/<txhash>.json) in the OUT directory.',
+    '# HELP trace_collector_output_files Total trace files (<hh>/<codehash>/<selector>/<txhash>.json) in the OUT directory.',
     '# TYPE trace_collector_output_files gauge',
     `trace_collector_output_files${LABELS} ${totalOutputFiles()}`,
     '# HELP trace_collector_buckets Distinct codehash_selector buckets currently tracked.',
@@ -302,8 +300,7 @@ function writeMetrics(lastBlock) {
 let counts;    // bucketId -> Anzahl gesammelter Traces
 
 function bucketId(codehash, selector) {
-  const sel = selector === '0x' ? 'fallback' : selector.slice(2);
-  return `${codehash.slice(2)}_${sel}`;
+  return bucketKey(codehash, selector);
 }
 
 async function processBlock(n) {
@@ -323,7 +320,7 @@ async function processBlock(n) {
     const input = tx.input || '0x';
     const selector = input.length >= 10 ? input.slice(0, 10) : '0x';
     const bucket = bucketId(codehash, selector);
-    const file = path.join(OUT, bucket, `${tx.hash}.json`);
+    const file = path.join(OUT, bucketRelPath(codehash, selector), `${tx.hash}.json`);
     if (fs.existsSync(file)) continue;                       // schon gesammelt -> idempotent
     const cur = counts.get(bucket) || 0;
     if (cur >= CAP) continue;                                // Bucket voll
@@ -407,7 +404,7 @@ async function processBlock(n) {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function main() {
-  await loadAccessListModule();
+  await loadSupportModules();
   fs.mkdirSync(OUT, { recursive: true });
   counts = rebuildCounts();
 

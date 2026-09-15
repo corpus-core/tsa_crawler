@@ -10,6 +10,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { sloadsToAccessList, collectTraceSlots } from './proxy_accesslist.mjs';
 import { traceToSimulation, txParamsFromMeta, extractRevertData } from './sim-from-trace.mjs';
+import { listTraceFiles } from './bucket_paths.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const IN = process.env.IN || './test_data';
@@ -25,7 +26,6 @@ const EXPLAINER_DIR = process.env.EXPLAINER_DIR
     || path.resolve(__dirname, '../colibri-stateless/bindings/emscripten/packages/explainer');
 const PROM_FILE = process.env.PROM_FILE || '';
 const CHAIN = process.env.CHAIN || 'mainnet';
-const TRACE_FILE_RE = /^0x[0-9a-f]{64}\.json$/;
 if (!process.env.C4_STATE_DIR) process.env.C4_STATE_DIR = '.';
 
 // --------------------------- Prometheus-Metriken ---------------------------
@@ -141,25 +141,6 @@ function writeAtomic(file, obj, pretty = false) {
     const tmp = file + '.tmp';
     fs.writeFileSync(tmp, (pretty ? JSON.stringify(obj, null, 2) : JSON.stringify(obj)) + '\n');
     fs.renameSync(tmp, file);
-}
-
-function listTraceFiles(root) {
-    const out = [];
-    if (!fs.existsSync(root)) return out;
-    const names = fs.readdirSync(root);
-    for (const name of names) {
-        if (TRACE_FILE_RE.test(name)) out.push(path.join(root, name));
-    }
-    for (const name of names) {
-        const dir = path.join(root, name);
-        let st;
-        try { st = fs.statSync(dir); } catch { continue; }
-        if (!st.isDirectory()) continue;
-        for (const f of fs.readdirSync(dir)) {
-            if (TRACE_FILE_RE.test(f)) out.push(path.join(dir, f));
-        }
-    }
-    return out;
 }
 
 function missingOutput(traces, destFn) {

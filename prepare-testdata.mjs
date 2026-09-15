@@ -129,6 +129,7 @@ async function rpc(method, params) {
     const j = await res.json();
     if (j.error) {
         const err = new Error(`${method}: ${JSON.stringify(j.error)}`);
+        console.error('rpc-error:', err.message);
         err.rpcError = j.error;
         throw err;
     }
@@ -208,6 +209,7 @@ async function resolveReturnValue(file) {
         }, 'latest']);
         return '0x';
     } catch (e) {
+        console.error('warn : resolveReturnValue error', path.basename(file.name), e.message);
         return extractRevertData(e.rpcError) || '0x';
     }
 }

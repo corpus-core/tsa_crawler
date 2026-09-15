@@ -140,6 +140,7 @@ export async function sloadsToAccessList(sloads, opts) {
                     codeHashCache.set(addr, codeHash);
                 }
             } catch {
+                console.error('warn : eth_getProof error', addr, e.message);
                 codeHash = null;
             }
         }
@@ -182,7 +183,8 @@ export async function sloadsToAccessList(sloads, opts) {
             if (hit === undefined) {
                 try {
                     hit = detectMinimalProxy(await rpc('eth_getCode', [addr, blockTag]));
-                } catch {
+                } catch (e) {
+                    console.error('warn : eth_getCode error', addr, e.message);
                     hit = null;
                 }
                 codeCache.set(codeHash, hit);
@@ -202,6 +204,7 @@ export async function sloadsToAccessList(sloads, opts) {
                     value = pad32(raw);
                     if (value) values.set(addr + ':' + implSlot, value);
                 } catch {
+                    console.error('warn : eth_getProof error', addr, implSlot, e.message);
                     value = null;
                 }
             }

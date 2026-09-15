@@ -4,6 +4,7 @@
     "scripts": {
         "prepare-testdata": "node prepare-testdata.mjs",
         "migrate-buckets": "node migrate-bucket-layout.mjs",
+        "query": "node query.mjs",
         "test": "node --test test/*.test.mjs"
     }
 }

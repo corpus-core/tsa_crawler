@@ -99,7 +99,7 @@ function writeMetrics() {
         fs.writeFileSync(tmp, lines.join('\n'));
         fs.renameSync(tmp, PROM_FILE);
     } catch (e) {
-        console.error('metrics-error:', e.message);
+        console.warn('metrics-error:', e.message);
     }
 }
 
@@ -275,7 +275,7 @@ async function step2(traceFile, explainer) {
     if (!FORCE && (fs.existsSync(dest) || fs.existsSync(skip))) return 'skip';
     const simFile = simPath(traceFile);
     if (!fs.existsSync(simFile)) {
-        console.error('step2 missing sim', path.basename(traceFile));
+        console.warn('step2 missing sim', path.basename(traceFile));
         return 'err';
     }
     const file = JSON.parse(fs.readFileSync(traceFile, 'utf8'));

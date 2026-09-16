@@ -83,6 +83,7 @@ The explainer lives **outside** this repo (`EXPLAINER_DIR`). Docker sets `SKIP_E
 - `qualityScore(hit)` is `gasUsed/1e5 + eventCount/3 + callCount/5 + stateChangeCount/10` from the first userPrompt sections (gas thousands-separators stripped). Per-cluster CAP keeps highest scores; ties keep the lexicographically first `relPath`.
 - Index only metadata after scoring — do not retain every userPrompt in memory.
 - `OUT` must not be `DATA_DIR` or a parent of it. A `train/` subdirectory under DATA_DIR is safe (`walkBuckets` ignores non-hex top-level names).
+- Keep-set copy: `_prompt.json` plus sibling `_sim.json` when present. Do not copy collector traces. Missing sims are skipped.
 - Prometheus: own `PROM_FILE` per process **and** chain. Write after every completed run (including `--dry-run`); skip help / early validation errors. Atomic `*.tmp` + rename.
 
 ## Coding rules

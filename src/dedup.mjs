@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Cluster `_prompt.json` files by (method_id × Solidity interface) and copy a
-// CAP-sized keep-set to OUT. DATA_DIR is read-only.
+// CAP-sized keep-set to OUT (`_prompt.json` + sibling `_sim.json`). DATA_DIR is read-only.
 //
 //   DATA_DIR=test_data OUT=./train_data CAP=5 node src/dedup.mjs
 //   DATA_DIR=test_data node src/dedup.mjs --dry-run
@@ -15,14 +15,17 @@ import {
     firstUserPrompt,
     splitSections,
     sectionText,
+    simPathForPrompt,
 } from './query.mjs';
 
 export const DEFAULT_CAP = 5;
+export const DEFAULT_PROGRESS_EVERY = 5000;
 export const MANIFEST_NAME = '.dedup-manifest.json';
 
 const BUCKET_KEY_RE = /^([0-9a-f]{64})_([0-9a-f]{8}|fallback)$/;
 const SOURCE_BEGIN = '<<<C4_UNTRUSTED_SOURCE';
 const SOURCE_END = '<<<C4_END_UNTRUSTED_SOURCE>>>';
+const SIM_FILE_RE = /^0x[0-9a-f]{64}_sim\.json$/;
 const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 const TYPE_NAME_RE = /^(u?int\d*|bytes\d*|address|bool|string|bytes|byte|fixed|ufixed)$/;
 const VISIBILITY_PRIVATE_RE = /\b(internal|private)\b/;
@@ -109,6 +112,18 @@ export function resolveCap(env = process.env, flags = {}) {
         throw new Error('CAP must be a positive integer');
     }
     return Number(env.CAP);
+}
+
+/**
+ * Heartbeat interval while scanning. `0` disables mid-scan logs.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @return {number}
+ */
+export function resolveProgressEvery(env = process.env) {
+    if (env.PROGRESS_EVERY === undefined || env.PROGRESS_EVERY === '') return DEFAULT_PROGRESS_EVERY;
+    if (!/^\d+$/.test(String(env.PROGRESS_EVERY))) return DEFAULT_PROGRESS_EVERY;
+    return Number(env.PROGRESS_EVERY);
 }
 
 /**
@@ -209,12 +224,14 @@ export function parseTxFunction(userPrompt) {
  * Stream DATA_DIR. Returned records do not keep `userPrompt`.
  *
  * @param {string} root
- * @param {{ qualityScore?: typeof qualityScore, onWarn?: (msg: string) => void }} [opts]
+ * @param {{ qualityScore?: typeof qualityScore, onWarn?: (msg: string) => void, onProgress?: (msg: string) => void, progressEvery?: number }} [opts]
  * @return {{ candidates: Array<{ relPath: string, absPath: string, methodId: string, fingerprint: string, cluster: string, score: number, txFunction: string | null }>, scanned: number, skippedNocode: number, skippedBad: number }}
  */
 export function collectCandidates(root, opts = {}) {
     const scoreFn = opts.qualityScore || qualityScore;
     const onWarn = opts.onWarn;
+    const onProgress = opts.onProgress;
+    const progressEvery = opts.progressEvery || 0;
     const candidates = [];
     let scanned = 0;
     let skippedNocode = 0;
@@ -233,6 +250,9 @@ export function collectCandidates(root, opts = {}) {
         for (const name of names) {
             if (!PROMPT_FILE_RE.test(name)) continue;
             scanned++;
+            if (progressEvery > 0 && scanned % progressEvery === 0) {
+                onProgress?.(`dedup: scanned ${scanned} ...`);
+            }
             const absPath = path.join(dir, name);
             let parsed;
             try {
@@ -338,17 +358,28 @@ export function assertSafeOutDir(dataDir, outDir) {
 
 /**
  * Copy keepers with the same relative layout. Overwrites previous keep-set
- * prompt files under OUT (hash-sharded `_prompt.json` only).
+ * `_prompt.json` and sibling `_sim.json` under OUT.
  *
  * @param {string} outDir
  * @param {Array<{ relPath: string, absPath: string }>} kept
+ * @return {{ prompts: number, sims: number }}
  */
 export function copyKeepers(outDir, kept) {
-    removePromptTree(outDir);
+    removeKeepTree(outDir);
+    let sims = 0;
     for (const item of kept) {
         const dest = path.join(outDir, item.relPath);
         atomicCopy(item.absPath, dest);
+        const simSrc = simPathForPrompt(item.absPath);
+        try {
+            atomicCopy(simSrc, simPathForPrompt(dest));
+            sims++;
+        } catch (e) {
+            if (e && e.code === 'ENOENT') continue;
+            throw e;
+        }
     }
+    return { prompts: kept.length, sims };
 }
 
 /**
@@ -428,6 +459,9 @@ export function formatMetrics(stats, chain = 'mainnet') {
         '# HELP trace_dedup_copied Prompt files written to OUT in the last run (0 on dry-run).',
         '# TYPE trace_dedup_copied gauge',
         `trace_dedup_copied${labels} ${stats.copied}`,
+        '# HELP trace_dedup_copied_sim Sibling _sim.json files written to OUT in the last run (0 on dry-run).',
+        '# TYPE trace_dedup_copied_sim gauge',
+        `trace_dedup_copied_sim${labels} ${stats.copiedSim || 0}`,
         '# HELP trace_dedup_dry_run 1 if the last run was --dry-run.',
         '# TYPE trace_dedup_dry_run gauge',
         `trace_dedup_dry_run${labels} ${stats.dryRun ? 1 : 0}`,
@@ -512,12 +546,16 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
         }
     }
 
+    io.log(`dedup: scanning ${dataDir} cap=${cap}${flags.dryRun ? ' dry-run' : ''}`);
     const collected = collectCandidates(dataDir, {
         qualityScore: opts.qualityScore || qualityScore,
         onWarn: (msg) => io.error(msg),
+        onProgress: (msg) => io.log(msg),
+        progressEvery: resolveProgressEvery(env),
     });
-    const { kept, dropped } = selectByCap(collected.candidates, cap);
     const clusters = new Set(collected.candidates.map((c) => c.cluster)).size;
+    io.log(`dedup: scanned ${collected.scanned}, ${clusters} clusters, selecting cap=${cap}`);
+    const { kept, dropped } = selectByCap(collected.candidates, cap);
 
     io.log(formatSummary({
         scanned: collected.scanned,
@@ -529,8 +567,10 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
         dropped,
     }));
 
+    let copiedSim = 0;
     if (!flags.dryRun) {
-        copyKeepers(outDir, kept);
+        io.log(`dedup: copying ${kept.length} prompts (+ sibling _sim.json) -> ${outDir}`);
+        copiedSim = copyKeepers(outDir, kept).sims;
         writeManifest(outDir, {
             cap,
             scanned: collected.scanned,
@@ -562,6 +602,7 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
         dropped: dropped.length,
         cap,
         copied: flags.dryRun ? 0 : kept.length,
+        copiedSim,
         lastRunTs: Math.floor(Date.now() / 1000),
         dryRun: flags.dryRun,
     }, {
@@ -585,7 +626,7 @@ function atomicCopy(src, dest) {
     fs.renameSync(tmp, dest);
 }
 
-function removePromptTree(outDir) {
+function removeKeepTree(outDir) {
     if (!fs.existsSync(outDir)) return;
     walkBuckets(outDir, (dir) => {
         let names;
@@ -595,7 +636,9 @@ function removePromptTree(outDir) {
             return;
         }
         for (const name of names) {
-            if (PROMPT_FILE_RE.test(name)) fs.unlinkSync(path.join(dir, name));
+            if (PROMPT_FILE_RE.test(name) || SIM_FILE_RE.test(name)) {
+                fs.unlinkSync(path.join(dir, name));
+            }
         }
     });
 }

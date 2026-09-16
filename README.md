@@ -147,7 +147,7 @@ DATA_DIR=./test_data npm run query -- -q events:Approval -l 20
 
 ## 4. Dedup — `src/dedup.mjs`
 
-Clusters `_prompt.json` files so similar contracts (e.g. ERC20 clones with different names/codehashes) share a bucket, then copies a CAP-sized keep-set to `OUT`. Only the first `userPrompt` is used. Matching is **path method id × public Solidity interface** (function/event signatures from the `code` section). `_prompt.nosrc` and prompts without a C4 source body are skipped. `DATA_DIR` is never modified.
+Clusters `_prompt.json` files so similar contracts (e.g. ERC20 clones with different names/codehashes) share a bucket, then copies a CAP-sized keep-set to `OUT` (`_prompt.json` plus sibling `_sim.json` when present). Only the first `userPrompt` is used. Matching is **path method id × public Solidity interface** (function/event signatures from the `code` section). `_prompt.nosrc` and prompts without a C4 source body are skipped. `DATA_DIR` is never modified.
 
 `qualityScore(hit)` ranks prompts inside a full cluster: `gasUsed/1e5 + events/3 + calls/5 + stateChanges/10` (gas commas like `46,622` are stripped). When a cluster is over `CAP`, the lowest-scoring prompts are dropped; ties keep the lexicographically first `relPath`.
 
@@ -164,10 +164,11 @@ DATA_DIR=./test_data npm run dedup -- --out ./train_data --keep 1
 | `CAP` / `--keep` | `5` | Max prompts per (method × interface) cluster |
 | `PROM_FILE` | *(off)* | Prometheus textfile path (own file; do not share with collector/prepare) |
 | `CHAIN` | `mainnet` | Metric label |
+| `PROGRESS_EVERY` | `5000` | Log `dedup: scanned N ...` every N prompt files (`0` = off) |
 | `--dry-run` | | Stats only; no copy |
 | `-h` | | Help |
 
-`OUT` must not be `DATA_DIR` (or a parent of it). A subdirectory such as `DATA_DIR/train` is fine: `walkBuckets` ignores names that are not a 2-hex prefix. Each run overwrites previous keep-set `_prompt.json` files under `OUT` and writes `OUT/.dedup-manifest.json`.
+`OUT` must not be `DATA_DIR` (or a parent of it). A subdirectory such as `DATA_DIR/train` is fine: `walkBuckets` ignores names that are not a 2-hex prefix. Each run overwrites previous keep-set `_prompt.json` and sibling `_sim.json` files under `OUT` and writes `OUT/.dedup-manifest.json`.
 
 ---
 

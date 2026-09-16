@@ -6,7 +6,9 @@ import path from 'node:path';
 import {
     parseArgs,
     resolveCap,
+    resolveProgressEvery,
     DEFAULT_CAP,
+    DEFAULT_PROGRESS_EVERY,
     HELP,
     qualityScore,
     extractSourceBodies,
@@ -167,6 +169,13 @@ describe('parseArgs / resolveCap', () => {
         assert.equal(resolveCap({ CAP: '8' }, {}), 8);
         assert.equal(resolveCap({ CAP: '8' }, { keep: 2 }), 2);
         assert.throws(() => resolveCap({ CAP: '0' }, {}), /positive integer/);
+    });
+
+    it('resolves PROGRESS_EVERY', () => {
+        assert.equal(resolveProgressEvery({}), DEFAULT_PROGRESS_EVERY);
+        assert.equal(resolveProgressEvery({ PROGRESS_EVERY: '1' }), 1);
+        assert.equal(resolveProgressEvery({ PROGRESS_EVERY: '0' }), 0);
+        assert.equal(resolveProgressEvery({ PROGRESS_EVERY: 'nope' }), DEFAULT_PROGRESS_EVERY);
     });
 });
 
@@ -349,19 +358,35 @@ describe('collectCandidates + copy', () => {
         assert.ok(kept[0].score > dropped[0].score);
     });
 
-    it('copyKeepers preserves layout and drops stale prompts', () => {
+    it('copyKeepers preserves layout, copies sibling sims, and drops stale files', () => {
         root = fs.mkdtempSync(path.join(os.tmpdir(), 'dedup-'));
         const rel = writePrompt(root, TX_A, wrapSource(ERC20_BASE));
+        const simRel = rel.replace(/_prompt\.json$/, '_sim.json');
+        fs.writeFileSync(path.join(root, simRel), JSON.stringify({ status: '0x1' }));
         const out = path.join(root, 'train');
         const stale = writePrompt(out, TX_B, wrapSource(ERC20_BASE));
+        const staleSim = stale.replace(/_prompt\.json$/, '_sim.json');
+        fs.writeFileSync(path.join(out, staleSim), '{}');
         const { candidates } = collectCandidates(root);
         const kept = candidates.filter((c) => c.relPath === rel);
-        copyKeepers(out, kept);
+        const stats = copyKeepers(out, kept);
+        assert.deepEqual(stats, { prompts: 1, sims: 1 });
         assert.equal(fs.existsSync(path.join(out, rel)), true);
+        assert.equal(fs.existsSync(path.join(out, simRel)), true);
         assert.equal(fs.existsSync(path.join(out, stale)), false);
+        assert.equal(fs.existsSync(path.join(out, staleSim)), false);
         const copied = JSON.parse(fs.readFileSync(path.join(out, rel), 'utf8'));
         assert.equal(copied[0].style, 'simple');
         assert.equal(copied[0].userPrompt, copied[1].userPrompt);
+        assert.deepEqual(JSON.parse(fs.readFileSync(path.join(out, simRel), 'utf8')), { status: '0x1' });
+    });
+
+    it('copyKeepers skips a missing sibling sim', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'dedup-'));
+        const rel = writePrompt(root, TX_A, wrapSource(ERC20_BASE));
+        const stats = copyKeepers(path.join(root, 'train'), [{ relPath: rel, absPath: path.join(root, rel) }]);
+        assert.deepEqual(stats, { prompts: 1, sims: 0 });
+        assert.equal(fs.existsSync(path.join(root, 'train', rel)), true);
     });
 
     it('refuses OUT equal to DATA_DIR', () => {
@@ -398,19 +423,27 @@ describe('main', () => {
         root = fs.mkdtempSync(path.join(os.tmpdir(), 'dedup-'));
         const relA = writePrompt(root, TX_A, wrapSource(ERC20_BASE), { hash: HASH_A });
         writePrompt(root, TX_B, wrapSource(ERC20_BASE), { hash: HASH_B });
+        const simA = relA.replace(/_prompt\.json$/, '_sim.json');
+        fs.writeFileSync(path.join(root, simA), JSON.stringify({ gasUsed: '0x10' }));
         const out = path.join(root, 'train');
 
         const { logs, io } = capture();
-        main({ DATA_DIR: root }, ['--dry-run'], io);
+        main({ DATA_DIR: root, PROGRESS_EVERY: '1' }, ['--dry-run'], io);
         assert.equal(process.exitCode, undefined);
         assert.equal(fs.existsSync(out), false);
-        assert.match(logs[0], /kept: 2/);
-        assert.match(logs[0], /dropped: 0/);
-        assert.match(logs[0], /cap: 5/);
+        assert.match(logs.join('\n'), /dedup: scanning /);
+        assert.match(logs.join('\n'), /dedup: scanned 1 \.\.\./);
+        assert.match(logs.join('\n'), /dedup: scanned 2, \d+ clusters/);
+        assert.match(logs.join('\n'), /dedup: scanning /);
+        assert.match(logs.join('\n'), /kept: 2/);
+        assert.match(logs.join('\n'), /dropped: 0/);
+        assert.match(logs.join('\n'), /cap: 5/);
 
         logs.length = 0;
         main({ DATA_DIR: root }, ['--out', out, '--keep', '1'], io);
+        assert.match(logs.join('\n'), /dedup: copying 1 prompts /);
         assert.equal(fs.existsSync(path.join(out, relA)), true);
+        assert.equal(fs.existsSync(path.join(out, simA)), true);
         const prompts = [];
         for (const c of collectCandidates(out).candidates) prompts.push(c.relPath);
         assert.deepEqual(prompts, [relA]);
@@ -442,6 +475,7 @@ describe('main', () => {
         main({ DATA_DIR: root, PROM_FILE: prom, CHAIN: 'sepolia' }, ['--out', out, '--keep', '1'], io);
         const after = fs.readFileSync(prom, 'utf8');
         assert.match(after, /trace_dedup_copied\{chain="sepolia"\} 1/);
+        assert.match(after, /trace_dedup_copied_sim\{chain="sepolia"\} 0/);
         assert.match(after, /trace_dedup_dry_run\{chain="sepolia"\} 0/);
     });
 
@@ -465,6 +499,7 @@ describe('formatMetrics / writeMetrics', () => {
             dropped: 3,
             cap: 5,
             copied: 4,
+            copiedSim: 4,
             lastRunTs: 1700000000,
             dryRun: false,
         }, 'mainnet');
@@ -472,6 +507,7 @@ describe('formatMetrics / writeMetrics', () => {
         assert.match(body, /trace_dedup_scanned\{chain="mainnet"\} 10/);
         assert.match(body, /trace_dedup_skipped_nocode\{chain="mainnet"\} 2/);
         assert.match(body, /trace_dedup_cap\{chain="mainnet"\} 5/);
+        assert.match(body, /trace_dedup_copied_sim\{chain="mainnet"\} 4/);
         assert.equal(body.endsWith('\n'), true);
     });
 

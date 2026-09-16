@@ -11,6 +11,8 @@ USER node
 
 ENV DATA_DIR=/data/traces \
     OUT=/data/traces/train \
-    CAP=5
+    CAP=5 \
+    CHAIN=mainnet \
+    PROM_FILE=""
 
 CMD ["node", "dedup.mjs"]

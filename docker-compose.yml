@@ -108,7 +108,7 @@ services:
       dockerfile: Dockerfile.dedup
     image: colibri/trace-dedup:latest
     container_name: trace-dedup
-    profiles: ["dedup"]
+    profiles: [ "dedup" ]
     restart: "no"
 
     logging:
@@ -123,8 +123,12 @@ services:
       # Sibling of the hash shards; walkBuckets ignores non-[0-9a-f]{2} names.
       OUT: "/data/traces/train"
       CAP: "5"
+      CHAIN: "mainnet"
+      # Own file: collector/prepare/dedup must not share a .prom (last writer wins).
+      PROM_FILE: "/metrics/trace_dedup_mainnet.prom"
 
     volumes:
       - /srv/trace-data:/data/traces
+      - /srv/node_exporter/textfile:/metrics
 
     mem_limit: 1g

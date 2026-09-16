@@ -80,9 +80,10 @@ The explainer lives **outside** this repo (`EXPLAINER_DIR`). Docker sets `SKIP_E
 - Read-only on `DATA_DIR`. Never delete source `_prompt.json` / `_prompt.nosrc`.
 - First userPrompt only. Skip files without a `code` section C4 source body (and skip `_prompt.nosrc`).
 - Cluster key is `<path method_id>:<sha256 of canonical public/external function+event signatures>`. Events/state/call do not affect the key.
-- `qualityScore(hit)` is a hook; stub returns `1`. Per-cluster CAP keeps highest scores; ties keep the lexicographically first `relPath`.
+- `qualityScore(hit)` is `gasUsed/1e5 + eventCount/3 + callCount/5 + stateChangeCount/10` from the first userPrompt sections (gas thousands-separators stripped). Per-cluster CAP keeps highest scores; ties keep the lexicographically first `relPath`.
 - Index only metadata after scoring — do not retain every userPrompt in memory.
 - `OUT` must not be `DATA_DIR` or a parent of it. A `train/` subdirectory under DATA_DIR is safe (`walkBuckets` ignores non-hex top-level names).
+- Prometheus: own `PROM_FILE` per process **and** chain. Write after every completed run (including `--dry-run`); skip help / early validation errors. Atomic `*.tmp` + rename.
 
 ## Coding rules
 

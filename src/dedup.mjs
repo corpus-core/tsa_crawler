@@ -43,13 +43,22 @@ Options:
 `;
 
 /**
- * Stub quality score. Higher is better. Replace later; keep this signature.
+ * Prefer richer traces: more gas, events, calls, and storage writes.
  *
- * @param {{ relPath: string, absPath: string, userPrompt: string, methodId: string, codeSection: string }} _hit
+ * `score = gasUsed/1e5 + eventCount/3 + callCount/5 + stateChangeCount/10`
+ *
+ * @param {{ relPath?: string, absPath?: string, userPrompt?: string, methodId?: string, codeSection?: string }} hit
  * @return {number}
  */
-export function qualityScore(_hit) {
-    return 1;
+export function qualityScore(hit) {
+    const userPrompt = hit?.userPrompt;
+    if (typeof userPrompt !== 'string') return 0;
+    const parts = splitSections(userPrompt);
+    const gas = parseGasUsed(sectionText(parts, 'tx'));
+    const events = countNumberedItems(sectionText(parts, 'events'));
+    const calls = countCallTraces(sectionText(parts, 'call'));
+    const state = countBulletItems(sectionText(parts, 'state'));
+    return gas / 100000 + events / 3 + calls / 5 + state / 10;
 }
 
 /**
@@ -433,7 +442,7 @@ export function formatMetrics(stats, chain = 'mainnet') {
  * Atomically write `formatMetrics` to `promFile`. No-op when `promFile` is empty.
  *
  * @param {string} promFile
- * @param {Parameters<typeof formatMetrics>[0]} stats
+ * @param {object} stats  Last-run counts (`scanned`, `kept`, `copied`, …)
  * @param {{ chain?: string, onError?: (msg: string) => void }} [opts]
  */
 export function writeMetrics(promFile, stats, opts = {}) {
@@ -508,6 +517,7 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
         onWarn: (msg) => io.error(msg),
     });
     const { kept, dropped } = selectByCap(collected.candidates, cap);
+    const clusters = new Set(collected.candidates.map((c) => c.cluster)).size;
 
     io.log(formatSummary({
         scanned: collected.scanned,
@@ -519,28 +529,44 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
         dropped,
     }));
 
-    if (flags.dryRun) return;
+    if (!flags.dryRun) {
+        copyKeepers(outDir, kept);
+        writeManifest(outDir, {
+            cap,
+            scanned: collected.scanned,
+            skippedNocode: collected.skippedNocode,
+            skippedBad: collected.skippedBad,
+            clusters,
+            kept: kept.map((c) => ({
+                relPath: c.relPath,
+                cluster: c.cluster,
+                methodId: c.methodId,
+                score: c.score,
+                txFunction: c.txFunction,
+            })),
+            dropped: dropped.map((c) => ({
+                relPath: c.relPath,
+                cluster: c.cluster,
+                methodId: c.methodId,
+                score: c.score,
+            })),
+        });
+    }
 
-    copyKeepers(outDir, kept);
-    writeManifest(outDir, {
-        cap,
+    writeMetrics(env.PROM_FILE || '', {
         scanned: collected.scanned,
         skippedNocode: collected.skippedNocode,
         skippedBad: collected.skippedBad,
-        clusters: new Set(collected.candidates.map((c) => c.cluster)).size,
-        kept: kept.map((c) => ({
-            relPath: c.relPath,
-            cluster: c.cluster,
-            methodId: c.methodId,
-            score: c.score,
-            txFunction: c.txFunction,
-        })),
-        dropped: dropped.map((c) => ({
-            relPath: c.relPath,
-            cluster: c.cluster,
-            methodId: c.methodId,
-            score: c.score,
-        })),
+        clusters,
+        kept: kept.length,
+        dropped: dropped.length,
+        cap,
+        copied: flags.dryRun ? 0 : kept.length,
+        lastRunTs: Math.floor(Date.now() / 1000),
+        dryRun: flags.dryRun,
+    }, {
+        chain: env.CHAIN || 'mainnet',
+        onError: (msg) => io.error(msg),
     });
 }
 
@@ -777,6 +803,36 @@ function canonicalizeParam(raw) {
         s = named[1];
     }
     return s.replace(/\s+/g, '');
+}
+
+function parseGasUsed(txSection) {
+    const m = txSection.match(/^- Gas used: (.+)$/m);
+    if (!m) return 0;
+    const n = Number(String(m[1]).replace(/,/g, '').trim());
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+function countNumberedItems(section) {
+    let n = 0;
+    for (const line of section.split('\n')) {
+        if (/^\d+\.\s/.test(line)) n++;
+    }
+    return n;
+}
+
+function countCallTraces(section) {
+    let n = countNumberedItems(section);
+    const more = section.match(/^\.\.\. and (\d+) more calls\s*$/m);
+    if (more) n += Number(more[1]);
+    return n;
+}
+
+function countBulletItems(section) {
+    let n = 0;
+    for (const line of section.split('\n')) {
+        if (/^- /.test(line)) n++;
+    }
+    return n;
 }
 
 const isMain = process.argv[1]

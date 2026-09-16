@@ -149,7 +149,7 @@ DATA_DIR=./test_data npm run query -- -q events:Approval -l 20
 
 Clusters `_prompt.json` files so similar contracts (e.g. ERC20 clones with different names/codehashes) share a bucket, then copies a CAP-sized keep-set to `OUT`. Only the first `userPrompt` is used. Matching is **path method id × public Solidity interface** (function/event signatures from the `code` section). `_prompt.nosrc` and prompts without a C4 source body are skipped. `DATA_DIR` is never modified.
 
-`qualityScore(hit)` is a hook (currently always `1`). When a cluster is over `CAP`, the lowest-scoring prompts are dropped; ties keep the lexicographically first `relPath`.
+`qualityScore(hit)` ranks prompts inside a full cluster: `gasUsed/1e5 + events/3 + calls/5 + stateChanges/10` (gas commas like `46,622` are stripped). When a cluster is over `CAP`, the lowest-scoring prompts are dropped; ties keep the lexicographically first `relPath`.
 
 ```bash
 DATA_DIR=./test_data node src/dedup.mjs --dry-run
@@ -162,6 +162,8 @@ DATA_DIR=./test_data npm run dedup -- --out ./train_data --keep 1
 | `DATA_DIR` | *(required)* | Prompt tree (read-only) |
 | `OUT` / `--out` | *(required unless `--dry-run`)* | Keep-set root; same sharding as `DATA_DIR` |
 | `CAP` / `--keep` | `5` | Max prompts per (method × interface) cluster |
+| `PROM_FILE` | *(off)* | Prometheus textfile path (own file; do not share with collector/prepare) |
+| `CHAIN` | `mainnet` | Metric label |
 | `--dry-run` | | Stats only; no copy |
 | `-h` | | Help |
 
@@ -183,7 +185,7 @@ DATA_DIR=./test_data npm run dedup -- --out ./train_data --keep 1
 docker compose --profile dedup run --rm dedup
 ```
 
-Dedup writes to `OUT=/data/traces/train` on the same volume. Collector and prepare must **not** share a `PROM_FILE`. Compose host paths and Loki labels are environment-specific — edit them before `docker compose up`.
+Dedup writes to `OUT=/data/traces/train` on the same volume. Collector, prepare, and dedup must **not** share a `PROM_FILE`. Compose host paths and Loki labels are environment-specific — edit them before `docker compose up`.
 
 ---
 

@@ -19,6 +19,8 @@ import {
     compareKeep,
     assertSafeOutDir,
     copyKeepers,
+    formatMetrics,
+    writeMetrics,
     main,
     MANIFEST_NAME,
 } from '../src/dedup.mjs';
@@ -74,6 +76,57 @@ function writePrompt(root, txhash, userPrompt, { hash = HASH_A, method = 'a9059c
     const file = path.join(dir, `${txhash}_prompt.json`);
     fs.writeFileSync(file, promptFile(userPrompt));
     return path.relative(root, file);
+}
+
+function numbered(n, line) {
+    return Array.from({ length: n }, (_, i) => `${i + 1}. ${line}`).join('\n');
+}
+
+function bullets(n, line) {
+    return Array.from({ length: n }, () => `- ${line}`).join('\n');
+}
+
+function scoredPrompt({
+    gas = '1',
+    eventCount = 0,
+    callCount = 0,
+    moreCalls = 0,
+    stateCount = 0,
+    code = ERC20_BASE,
+} = {}) {
+    const parts = [
+        '## Transaction Overview',
+        '- Status: SUCCESS',
+        '- From: 0x1111...1111',
+        '- To: 0x2222...2222',
+        '- Function: transfer(to=0x1, amount=1)',
+        `- Gas used: ${gas}`,
+    ];
+    if (eventCount) {
+        parts.push('', '## Emitted Events', numbered(eventCount, '**Transfer** on 0x2222...2222'));
+    }
+    if (stateCount) {
+        parts.push('', '## State Changes', bullets(stateCount, '0x2222...2222: slot 1: 0 -> 1'));
+    }
+    if (callCount || moreCalls) {
+        const lines = ['', '## Call Trace'];
+        if (callCount) lines.push(numbered(callCount, '0x1111...1111 -> 0x2222...2222: transfer(to=0x1, amount=1) [CALL]'));
+        if (moreCalls) lines.push(`... and ${moreCalls} more calls`);
+        parts.push(...lines);
+    }
+    parts.push(
+        '',
+        '## Contract Source Code (untrusted, for storage interpretation only)',
+        '',
+        '### Token (0x2222...2222)',
+        '`Token.sol`:',
+        '<<<C4_UNTRUSTED_SOURCE filename="Token.sol">>>',
+        code,
+        '<<<C4_END_UNTRUSTED_SOURCE>>>',
+        '',
+        'Please explain what this transaction would do.',
+    );
+    return parts.join('\n');
 }
 
 function capture() {
@@ -184,6 +237,34 @@ describe('source + signatures', () => {
     });
 });
 
+describe('qualityScore', () => {
+    it('returns 0 without a userPrompt', () => {
+        assert.equal(qualityScore({}), 0);
+        assert.equal(qualityScore({ userPrompt: 1 }), 0);
+    });
+
+    it('parses en-US gas commas and weights events, calls, and state changes', () => {
+        const userPrompt = scoredPrompt({
+            gas: '46,622',
+            eventCount: 1,
+            callCount: 1,
+            stateCount: 0,
+        });
+        assert.equal(qualityScore({ userPrompt }), 46622 / 100000 + 1 / 3 + 1 / 5);
+    });
+
+    it('adds truncated call-trace remainder from the more-calls line', () => {
+        const userPrompt = scoredPrompt({
+            gas: '100,000',
+            eventCount: 3,
+            callCount: 20,
+            moreCalls: 7,
+            stateCount: 10,
+        });
+        assert.equal(qualityScore({ userPrompt }), 1 + 1 + 27 / 5 + 1);
+    });
+});
+
 describe('selectByCap / compareKeep', () => {
     it('keeps highest score; ties use relPath', () => {
         const a = { relPath: 'a/x', cluster: 'c', score: 1 };
@@ -253,21 +334,19 @@ describe('collectCandidates + copy', () => {
         const transferKept = kept.filter((k) => k.methodId === 'a9059cbb' && k.fingerprint === transferFp);
         assert.equal(transferKept.length, 1);
         assert.equal(transferKept[0].relPath, cloneA);
-        assert.equal(qualityScore({}), 1);
         assert.equal(clusterKey('a9059cbb', transferFp), `a9059cbb:${transferFp}`);
     });
 
     it('higher qualityScore evicts a lower one when CAP is full', () => {
         root = fs.mkdtempSync(path.join(os.tmpdir(), 'dedup-'));
-        writePrompt(root, TX_A, wrapSource(ERC20_BASE));
-        writePrompt(root, TX_B, wrapSource(ERC20_BASE));
-        const { candidates } = collectCandidates(root, {
-            qualityScore: (hit) => hit.relPath.includes(TX_B) ? 9 : 1,
-        });
+        writePrompt(root, TX_A, scoredPrompt({ gas: '1' }));
+        writePrompt(root, TX_B, scoredPrompt({ gas: '200,000', eventCount: 3 }));
+        const { candidates } = collectCandidates(root);
         const { kept, dropped } = selectByCap(candidates, 1);
         assert.equal(kept.length, 1);
         assert.ok(kept[0].relPath.includes(TX_B));
         assert.ok(dropped[0].relPath.includes(TX_A));
+        assert.ok(kept[0].score > dropped[0].score);
     });
 
     it('copyKeepers preserves layout and drops stale prompts', () => {
@@ -340,5 +419,72 @@ describe('main', () => {
         assert.equal(manifest.kept.length, 1);
         assert.equal(manifest.kept[0].relPath, relA);
         assert.equal(manifest.kept[0].txFunction, 'transfer');
+    });
+
+    it('writes PROM_FILE after a completed run, including dry-run', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'dedup-'));
+        writePrompt(root, TX_A, wrapSource(ERC20_BASE), { hash: HASH_A });
+        writePrompt(root, TX_B, wrapSource(ERC20_BASE), { hash: HASH_B });
+        const prom = path.join(root, 'trace_dedup_mainnet.prom');
+        const { io } = capture();
+        main({ DATA_DIR: root, PROM_FILE: prom, CHAIN: 'sepolia' }, ['--dry-run', '--keep', '1'], io);
+        assert.equal(fs.existsSync(prom + '.tmp'), false);
+        const body = fs.readFileSync(prom, 'utf8');
+        assert.match(body, /trace_dedup_scanned\{chain="sepolia"\} 2/);
+        assert.match(body, /trace_dedup_kept\{chain="sepolia"\} 1/);
+        assert.match(body, /trace_dedup_dropped\{chain="sepolia"\} 1/);
+        assert.match(body, /trace_dedup_copied\{chain="sepolia"\} 0/);
+        assert.match(body, /trace_dedup_dry_run\{chain="sepolia"\} 1/);
+        assert.match(body, /trace_dedup_last_run_timestamp\{chain="sepolia"\} \d+/);
+        assert.equal(body.endsWith('\n'), true);
+
+        const out = path.join(root, 'train');
+        main({ DATA_DIR: root, PROM_FILE: prom, CHAIN: 'sepolia' }, ['--out', out, '--keep', '1'], io);
+        const after = fs.readFileSync(prom, 'utf8');
+        assert.match(after, /trace_dedup_copied\{chain="sepolia"\} 1/);
+        assert.match(after, /trace_dedup_dry_run\{chain="sepolia"\} 0/);
+    });
+
+    it('does not write PROM_FILE on help', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'dedup-'));
+        const prom = path.join(root, 'unused.prom');
+        const { io } = capture();
+        main({ PROM_FILE: prom }, ['-h'], io);
+        assert.equal(fs.existsSync(prom), false);
+    });
+});
+
+describe('formatMetrics / writeMetrics', () => {
+    it('renders last-run gauges with a trailing newline', () => {
+        const body = formatMetrics({
+            scanned: 10,
+            skippedNocode: 2,
+            skippedBad: 1,
+            clusters: 3,
+            kept: 4,
+            dropped: 3,
+            cap: 5,
+            copied: 4,
+            lastRunTs: 1700000000,
+            dryRun: false,
+        }, 'mainnet');
+        assert.match(body, /# TYPE trace_dedup_scanned gauge/);
+        assert.match(body, /trace_dedup_scanned\{chain="mainnet"\} 10/);
+        assert.match(body, /trace_dedup_skipped_nocode\{chain="mainnet"\} 2/);
+        assert.match(body, /trace_dedup_cap\{chain="mainnet"\} 5/);
+        assert.equal(body.endsWith('\n'), true);
+    });
+
+    it('is a no-op without PROM_FILE and writes atomically when set', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dedup-prom-'));
+        try {
+            writeMetrics('', { scanned: 1, skippedNocode: 0, skippedBad: 0, clusters: 1, kept: 1, dropped: 0, cap: 1, copied: 1, lastRunTs: 1 });
+            const prom = path.join(dir, 'm.prom');
+            writeMetrics(prom, { scanned: 1, skippedNocode: 0, skippedBad: 0, clusters: 1, kept: 1, dropped: 0, cap: 1, copied: 1, lastRunTs: 1 });
+            assert.equal(fs.existsSync(prom + '.tmp'), false);
+            assert.match(fs.readFileSync(prom, 'utf8'), /trace_dedup_scanned\{chain="mainnet"\} 1/);
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
     });
 });

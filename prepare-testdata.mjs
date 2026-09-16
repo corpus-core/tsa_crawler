@@ -2,7 +2,8 @@
 // Build {txhash}_sim.json and {txhash}_prompt.json from stored collector traces.
 // _prompt.json is an array: simple (explainer default) + detailed system prompt.
 // If Sourcify has no source, write {txhash}_prompt.nosrc so later runs skip it.
-// INTERVAL_S>0 repeats the run (server). SKIP_EXPLAINER_BUILD=1 uses a prebuilt dist.
+// STEPS=1,2a,2b (default). 2a = one prompt per unprocessed bucket; 2b = the rest.
+// STEPS=2 still runs 2a then 2b. INTERVAL_S>0 repeats. SKIP_EXPLAINER_BUILD=1 uses dist.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -16,7 +17,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const IN = process.env.IN || './test_data';
 const RPC = process.env.RPC || 'https://mainnet1.colibri-proof.tech/execution';
 const CHAIN_ID = parseInt(process.env.CHAIN_ID || '1', 10);
-const STEPS = (process.env.STEPS || '1,2').split(',').map((s) => s.trim()).filter(Boolean);
+const STEPS = (process.env.STEPS || '1,2a,2b').split(',').map((s) => s.trim()).filter(Boolean);
 const CONCURRENCY = parseInt(process.env.CONCURRENCY || '4', 10);
 const FORCE = process.env.FORCE === '1';
 const PROGRESS_EVERY = parseInt(process.env.PROGRESS_EVERY || '100', 10);
@@ -205,9 +206,51 @@ function promptSkipPath(traceFile) {
     return traceFile.replace(/\.json$/, '_prompt.nosrc');
 }
 
-function missingPrompts(traces) {
-    if (FORCE) return traces;
+function promptOutputName(name) {
+    return name.endsWith('_prompt.json') || name.endsWith('_prompt.nosrc');
+}
+
+/** True if the bucket directory already has any prompt or nosrc marker. */
+function bucketHasPromptOutput(dir) {
+    try {
+        return fs.readdirSync(dir).some(promptOutputName);
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Traces that still need a `_prompt.json` / `_prompt.nosrc`.
+ *
+ * @param {string[]} traces
+ * @param {{ force?: boolean }} [opts]
+ * @return {string[]}
+ */
+function missingPrompts(traces, { force = FORCE } = {}) {
+    if (force) return traces;
     return traces.filter((f) => !fs.existsSync(promptPath(f)) && !fs.existsSync(promptSkipPath(f)));
+}
+
+/**
+ * Step 2a: at most one trace per bucket, and only buckets with no prompt
+ * output yet. Later traces from the same directory stay for step 2b.
+ *
+ * @param {string[]} traces traces that already have `_sim.json`
+ * @param {{ force?: boolean }} [opts]
+ * @return {string[]}
+ */
+function missingPromptsOnePerNewBucket(traces, { force = FORCE } = {}) {
+    const pending = [];
+    const seenDirs = new Set();
+    for (const f of traces) {
+        if (!force && (fs.existsSync(promptPath(f)) || fs.existsSync(promptSkipPath(f)))) continue;
+        const dir = path.dirname(f);
+        if (seenDirs.has(dir)) continue;
+        if (!force && bucketHasPromptOutput(dir)) continue;
+        seenDirs.add(dir);
+        pending.push(f);
+    }
+    return pending;
 }
 
 async function step1(traceFile) {
@@ -248,6 +291,47 @@ function ensureExplainer() {
     const r = spawnSync('npm', ['run', 'build'], { cwd: EXPLAINER_DIR, stdio: 'inherit' });
     if (r.status !== 0) throw new Error('explainer build failed');
     return dist;
+}
+
+async function runPromptStep(label, files, explainer) {
+    if (!files.length) {
+        console.log(`${label}: nichts zu tun`);
+        return explainer;
+    }
+    if (!explainer) {
+        const dist = ensureExplainer();
+        explainer = await import(pathToFileURL(dist).href);
+    }
+    let ok = 0, skip = 0, nosrc = 0, err = 0, done = 0;
+    await mapLimit(files, CONCURRENCY, async (f) => {
+        try {
+            const r = await step2(f, explainer);
+            if (r === 'skip') skip++;
+            else if (r === 'nosrc') {
+                nosrc++;
+                nosrcWrittenTotal++;
+                lastCounts.nosrc++;
+            } else if (r === 'err') {
+                err++;
+                errorsTotal++;
+            } else {
+                ok++;
+                promptWrittenTotal++;
+                lastCounts.prompt++;
+            }
+        } catch (e) {
+            err++;
+            errorsTotal++;
+            console.error(label, path.basename(f), e.message);
+        }
+        done++;
+        if (done % PROGRESS_EVERY === 0) {
+            console.log(`${label}: ${done}/${files.length} ok=${ok} nosrc=${nosrc} err=${err}`);
+            writeMetrics();
+        }
+    });
+    console.log(`${label}: ${done}/${files.length} ok=${ok} skip=${skip} nosrc=${nosrc} err=${err}`);
+    return explainer;
 }
 
 async function step2(traceFile, explainer) {
@@ -334,50 +418,28 @@ async function runOnce(explainer) {
         writeMetrics();
     }
 
-    if (STEPS.includes('2')) {
+    const want2a = STEPS.includes('2a') || STEPS.includes('2');
+    const want2b = STEPS.includes('2b') || STEPS.includes('2');
+    if (want2a || want2b) {
         const withSim = all.filter((f) => fs.existsSync(simPath(f)));
-        const files = missingPrompts(withSim);
-        console.log(`step2: ${files.length} ohne _prompt.json/_prompt.nosrc (${withSim.length} haben _sim.json)`);
-        if (!files.length) {
-            console.log('step2: nichts zu tun');
-            lastRunTs = Math.floor(Date.now() / 1000);
-            snapshotCounts(all);
-            writeMetrics();
-            return explainer;
+        let step2aFiles = [];
+        if (want2a) {
+            step2aFiles = missingPromptsOnePerNewBucket(withSim);
+            console.log(
+                `step2a: ${step2aFiles.length} unbearbeitete Buckets, je 1 Tx `
+                + `(${withSim.length} haben _sim.json)`,
+            );
+            explainer = await runPromptStep('step2a', step2aFiles, explainer);
         }
-        if (!explainer) {
-            const dist = ensureExplainer();
-            explainer = await import(pathToFileURL(dist).href);
+        if (want2b) {
+            const skip = new Set(step2aFiles);
+            const files = missingPrompts(withSim).filter((f) => !skip.has(f));
+            console.log(
+                `step2b: ${files.length} restliche ohne _prompt.json/_prompt.nosrc `
+                + `(${withSim.length} haben _sim.json)`,
+            );
+            explainer = await runPromptStep('step2b', files, explainer);
         }
-        let ok = 0, skip = 0, nosrc = 0, err = 0, done = 0;
-        await mapLimit(files, CONCURRENCY, async (f) => {
-            try {
-                const r = await step2(f, explainer);
-                if (r === 'skip') skip++;
-                else if (r === 'nosrc') {
-                    nosrc++;
-                    nosrcWrittenTotal++;
-                    lastCounts.nosrc++;
-                } else if (r === 'err') {
-                    err++;
-                    errorsTotal++;
-                } else {
-                    ok++;
-                    promptWrittenTotal++;
-                    lastCounts.prompt++;
-                }
-            } catch (e) {
-                err++;
-                errorsTotal++;
-                console.error('step2', path.basename(f), e.message);
-            }
-            done++;
-            if (done % PROGRESS_EVERY === 0) {
-                console.log(`step2: ${done}/${files.length} ok=${ok} nosrc=${nosrc} err=${err}`);
-                writeMetrics();
-            }
-        });
-        console.log(`step2: ${done}/${files.length} ok=${ok} skip=${skip} nosrc=${nosrc} err=${err}`);
     }
     lastRunTs = Math.floor(Date.now() / 1000);
     snapshotCounts(all);
@@ -394,4 +456,15 @@ async function main() {
     }
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+const isMain = process.argv[1]
+    && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
+if (isMain) main().catch((e) => { console.error(e); process.exit(1); });
+
+export {
+    bucketHasPromptOutput,
+    missingPrompts,
+    missingPromptsOnePerNewBucket,
+    promptPath,
+    promptSkipPath,
+    simPath,
+};

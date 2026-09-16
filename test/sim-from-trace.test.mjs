@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { traceToSimulation, toQuantity, extractRevertData, txParamsFromMeta } from '../sim-from-trace.mjs';
+import { traceToSimulation, toQuantity, extractRevertData, txParamsFromMeta } from '../src/sim-from-trace.mjs';
 
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const FROM = '0x3610bad33aac567d2c5fb03e47eec5c2172fd42a';

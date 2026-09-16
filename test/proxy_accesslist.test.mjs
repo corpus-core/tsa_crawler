@@ -7,7 +7,7 @@ import {
     stripAccessListForSim,
     detectMinimalProxy,
     EMPTY_CODE_HASH,
-} from '../proxy_accesslist.mjs';
+} from '../src/proxy_accesslist.mjs';
 
 const ERC1967_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
 const PROXY = '0x1111111111111111111111111111111111111111';

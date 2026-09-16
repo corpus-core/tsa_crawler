@@ -8,7 +8,9 @@ x-logging: &logging
 
 services:
   collector:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.traces
     image: colibri/trace-collector:latest
     container_name: trace-collector
     restart: unless-stopped
@@ -78,7 +80,7 @@ services:
       C4_STATE_DIR: "/data/cache"
       RPC: "https://mainnet1.colibri-proof.tech/execution"
       CHAIN_ID: "1"
-      STEPS: "1,2"
+      STEPS: "1,2a,2b"
       CONCURRENCY: "2"
       INTERVAL_S: "300"
       EXPLAINER_DIR: "/opt/explainer"

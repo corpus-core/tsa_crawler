@@ -2,7 +2,7 @@
 // Filter prompt files under DATA_DIR.
 // Layout: <codehash[0:2]>/<codehash[2:]>/<method_id>/<txhash>_prompt.json
 //
-//   DATA_DIR=test_data node query.mjs -c 02 -m 095ea7b3 -q approve -d
+//   DATA_DIR=test_data node src/query.mjs -c 02 -m 095ea7b3 -q approve -d
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -11,7 +11,7 @@ import { walkBuckets, SELECTOR_DIR_RE } from './bucket_paths.mjs';
 
 export const PROMPT_FILE_RE = /^0x[0-9a-f]{64}_prompt\.json$/;
 
-export const HELP = `Usage: DATA_DIR=<dir> node query.mjs [options]
+export const HELP = `Usage: DATA_DIR=<dir> node src/query.mjs [options]
 
 Options:
   -q <searchstring>   Keep files whose first userPrompt contains this substring

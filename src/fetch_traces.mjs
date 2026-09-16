@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// collect-traces.js  —  Node 18+ (globales fetch)
+// fetch_traces.mjs  —  Node 18+ (global fetch)
 //
 // Forward-Streaming-Sammler fuer SLM-Trainingsdaten.
 // Alle POLL_MS pruefen, ob ein neuer Block da ist. Fuer jeden neuen Block:
@@ -13,11 +13,13 @@
 // Restart-sicher (State-Datei + Bucket-Counts aus dem FS rekonstruiert) und
 // Fenster-bewusst (traced nur innerhalb der ~128 Bloecke, die der Full-Node haelt).
 //
-// Aufruf:  RPC=http://127.0.0.1:8545 OUT=./traces CAP=5 node collect-traces.js
+// Aufruf:  RPC=http://127.0.0.1:8545 OUT=./traces CAP=5 node src/fetch_traces.mjs
 
-const fs = require('node:fs');
-const path = require('node:path');
-const { pathToFileURL } = require('node:url');
+import fs from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { sloadsToAccessList, collectTraceSlots } from './proxy_accesslist.mjs';
+import { bucketKey, bucketRelPath, countBuckets } from './bucket_paths.mjs';
 
 // --------------------------- Konfiguration ---------------------------------
 const RPC = process.env.RPC || 'http://127.0.0.1:8545';
@@ -201,22 +203,6 @@ async function rpc(method, params) {
 // eth_getProof liefert codeHash direkt (kanonisch, ohne lokales Keccak).
 const codeHashCache = new Map();
 const codeCache = new Map();
-let sloadsToAccessList;
-let collectTraceSlots;
-let bucketKey;
-let bucketRelPath;
-let countBuckets;
-
-async function loadSupportModules() {
-  if (sloadsToAccessList) return;
-  const access = await import(pathToFileURL(path.join(__dirname, 'proxy_accesslist.mjs')).href);
-  sloadsToAccessList = access.sloadsToAccessList;
-  collectTraceSlots = access.collectTraceSlots;
-  const paths = await import(pathToFileURL(path.join(__dirname, 'bucket_paths.mjs')).href);
-  bucketKey = paths.bucketKey;
-  bucketRelPath = paths.bucketRelPath;
-  countBuckets = paths.countBuckets;
-}
 
 async function getCodeHash(addr, blockHex) {
   const key = addr.toLowerCase();
@@ -404,7 +390,6 @@ async function processBlock(n) {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function main() {
-  await loadSupportModules();
   fs.mkdirSync(OUT, { recursive: true });
   counts = rebuildCounts();
 
@@ -443,4 +428,6 @@ async function main() {
   }
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+const isMain = process.argv[1]
+  && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
+if (isMain) main().catch(e => { console.error(e); process.exit(1); });

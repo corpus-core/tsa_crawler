@@ -24,13 +24,13 @@ const PROGRESS_EVERY = parseInt(process.env.PROGRESS_EVERY || '100', 10);
 const INTERVAL_S = parseInt(process.env.INTERVAL_S || '0', 10);
 const SKIP_EXPLAINER_BUILD = process.env.SKIP_EXPLAINER_BUILD === '1';
 const EXPLAINER_DIR = process.env.EXPLAINER_DIR
-    || path.resolve(__dirname, '../colibri-stateless/bindings/emscripten/packages/explainer');
+    || path.resolve(__dirname, '../../colibri-stateless/bindings/emscripten/packages/explainer');
 const PROM_FILE = process.env.PROM_FILE || '';
 const CHAIN = process.env.CHAIN || 'mainnet';
 if (!process.env.C4_STATE_DIR) process.env.C4_STATE_DIR = '.';
 
 // --------------------------- Prometheus-Metriken ---------------------------
-// Same textfile_collector pattern as index.js: complete exposition file,
+// Same textfile_collector pattern as fetch_traces.mjs: complete exposition file,
 // write to .tmp and rename. Process counters reset on restart; gauges
 // reflect the current IN directory. Separate PROM_FILE from the collector.
 let simWrittenTotal = 0;

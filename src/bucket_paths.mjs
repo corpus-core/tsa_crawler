@@ -1,18 +1,14 @@
 // Trace layout: OUT/<hh>/<codehash[2:]>/<selector>/<txhash>.json
 //   hh = first byte of the codehash (2 hex chars) → at most 256 top-level dirs
-// Two-level leftover: OUT/<codehash>/<selector>/
-// Legacy flat:        OUT/<codehash>_<selector>/
 // codehash and selector are stored without a 0x prefix; selector `0x` is `fallback`.
 
 import fs from 'node:fs';
 import path from 'node:path';
 
 export const TRACE_FILE_RE = /^0x[0-9a-f]{64}\.json$/;
-export const HASH_PREFIX_RE = /^[0-9a-f]{2}$/;
-export const HASH_REST_RE = /^[0-9a-f]{62}$/;
-export const CODEHASH_DIR_RE = /^[0-9a-f]{64}$/;
+const HASH_PREFIX_RE = /^[0-9a-f]{2}$/;
+const HASH_REST_RE = /^[0-9a-f]{62}$/;
 export const SELECTOR_DIR_RE = /^([0-9a-f]{8}|fallback)$/;
-export const LEGACY_BUCKET_RE = /^([0-9a-f]{64})_([0-9a-f]{8}|fallback)$/;
 
 /**
  * @param {string} codehash
@@ -43,7 +39,7 @@ export function selectorDirName(selector) {
 }
 
 /**
- * Stable in-memory bucket key (same string as the legacy directory name).
+ * Stable in-memory bucket key.
  *
  * @param {string} codehash
  * @param {string} selector
@@ -82,7 +78,7 @@ function listTraces(dir, out) {
 }
 
 /**
- * Visit every bucket directory. Supports sharded, two-level, and legacy trees.
+ * Visit every bucket directory.
  *
  * @param {string} root
  * @param {(absDir: string, key: string) => void} fn
@@ -90,24 +86,12 @@ function listTraces(dir, out) {
 export function walkBuckets(root, fn) {
     if (!fs.existsSync(root)) return;
     for (const name of fs.readdirSync(root)) {
-        if (name.startsWith('.')) continue;
+        if (name.startsWith('.') || !HASH_PREFIX_RE.test(name)) continue;
         const dir = path.join(root, name);
         let st;
         try { st = fs.statSync(dir); } catch { continue; }
         if (!st.isDirectory()) continue;
 
-        const legacy = name.match(LEGACY_BUCKET_RE);
-        if (legacy) {
-            fn(dir, name);
-            continue;
-        }
-
-        if (CODEHASH_DIR_RE.test(name)) {
-            walkSelectors(dir, name, fn);
-            continue;
-        }
-
-        if (!HASH_PREFIX_RE.test(name)) continue;
         for (const rest of fs.readdirSync(dir)) {
             if (!HASH_REST_RE.test(rest)) continue;
             const restDir = path.join(dir, rest);
@@ -131,8 +115,7 @@ function walkSelectors(parent, hash, fn) {
 }
 
 /**
- * Reconstruct bucket -> trace-count. Understands all layouts so a mixed tree
- * during migration does not drop CAP accounting.
+ * Reconstruct bucket -> trace-count from the filesystem.
  *
  * @param {string} root
  * @return {Map<string, number>}
@@ -153,10 +136,6 @@ export function countBuckets(root) {
  */
 export function listTraceFiles(root) {
     const out = [];
-    if (!fs.existsSync(root)) return out;
-    for (const name of fs.readdirSync(root)) {
-        if (TRACE_FILE_RE.test(name)) out.push(path.join(root, name));
-    }
     walkBuckets(root, (dir) => listTraces(dir, out));
     return out;
 }

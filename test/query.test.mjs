@@ -23,7 +23,7 @@ import {
     SECTION_COLOR,
     SIM_COLOR,
     RESET,
-} from '../query.mjs';
+} from '../src/query.mjs';
 
 const TX_A = '0x' + 'aa'.repeat(32);
 const TX_B = '0x' + 'bb'.repeat(32);

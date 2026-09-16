@@ -2,9 +2,9 @@
     "name": "tsa_crawler",
     "private": true,
     "scripts": {
-        "prepare-testdata": "node prepare-testdata.mjs",
-        "migrate-buckets": "node migrate-bucket-layout.mjs",
-        "query": "node query.mjs",
+        "fetch-traces": "node src/fetch_traces.mjs",
+        "prepare-testdata": "node src/prepare-testdata.mjs",
+        "query": "node src/query.mjs",
         "test": "node --test test/*.test.mjs"
     }
 }

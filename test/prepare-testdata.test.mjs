@@ -6,7 +6,7 @@ import path from 'node:path';
 import {
     missingPrompts,
     missingPromptsOnePerNewBucket,
-} from '../prepare-testdata.mjs';
+} from '../src/prepare-testdata.mjs';
 
 const HASH_A = 'aa'.repeat(32);
 const HASH_B = 'bb'.repeat(32);

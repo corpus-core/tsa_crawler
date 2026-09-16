@@ -1,6 +1,6 @@
 # Agent notes
 
-This repo builds **training prompts** for an SLM that explains Ethereum transactions. It is a small Node toolchain, not an app: collector → prepare → query.
+This repo builds **training prompts** for an SLM that explains Ethereum transactions. It is a small Node toolchain, not an app: collector → prepare → query → dedup.
 
 Read `README.md` for the human-facing pipeline and env vars. This file is for changing the code without breaking layout, CAP accounting, or the explainer contract.
 
@@ -13,10 +13,11 @@ All runnable code lives in `src/`. Tests stay in `test/` and import from `../src
 | `src/fetch_traces.mjs` | Live collector. Node builtins + static ESM imports only. The collector Docker image copies this file plus `proxy_accesslist.mjs` and `bucket_paths.mjs`. |
 | `src/prepare-testdata.mjs` | Trace → `_sim.json` → `_prompt.json`. Talks to RPC + Sourcify via the explainer. |
 | `src/query.mjs` | Read-only prompt filter. CLI is `parseArgs` / `main`; keep helpers exported for tests. |
+| `src/dedup.mjs` | Cluster prompts by (path method_id × interface hash); copy CAP keep-set to `OUT`. DATA_DIR is read-only. |
 | `src/bucket_paths.mjs` | **Single source of truth** for on-disk layout. |
 | `src/proxy_accesslist.mjs` | Access list + proxy implementation resolution. |
 | `src/sim-from-trace.mjs` | Collector file → Colibri simulation JSON. |
-| `Dockerfile.traces` / `Dockerfile.prepare` | COPY the needed `src/*.mjs` files into `/app` (flattened). Collector is alpine+node only. Prepare sparse-checkouts the explainer. |
+| `Dockerfile.traces` / `Dockerfile.prepare` / `Dockerfile.dedup` | COPY the needed `src/*.mjs` files into `/app` (flattened). Collector and dedup are alpine+node only. Prepare sparse-checkouts the explainer. Dedup copies `dedup.mjs`, `query.mjs`, `bucket_paths.mjs`. |
 | `test/*.test.mjs` | `node:test`. No network. Use temp dirs. |
 
 Everything is ESM (`.mjs`). Docker images do not use `package.json` `"type": "module"`; the `.mjs` suffix is enough.
@@ -35,7 +36,7 @@ Canonical path:
 - Collector traces match `^0x[0-9a-f]{64}\.json$`. `_sim.json`, `_prompt.json`, `_prompt.nosrc` are siblings, not traces. `listTraceFiles` must ignore them.
 - In-memory bucket id is `<64-hex-codehash>_<selector>` (`bucketKey`). CAP counting and query `-c`/`-m` depend on that.
 - Writes are atomic: `file.tmp` then `rename`. Never leave a half-written JSON as the final name.
-- `traces/`, `test_data/`, `sol_cache/` are gitignored. Do not commit them.
+- `traces/`, `test_data/`, `train_data/`, and `sol_cache/` are gitignored. Do not commit them.
 
 Changing the layout means updating `src/bucket_paths.mjs`, collector writes, prepare/query walks, and tests together.
 
@@ -74,13 +75,22 @@ The explainer lives **outside** this repo (`EXPLAINER_DIR`). Docker sets `SKIP_E
 - Section prefixes for `-q`: `tx`, `events`, `state`, `call`, `code` — must match `SECTION_HEADERS` in the explainer user prompt. If the explainer changes headings, update both.
 - `DATA_DIR` is required. Stream matches; do not load the whole tree into memory.
 
+## Dedup invariants (`src/dedup.mjs`)
+
+- Read-only on `DATA_DIR`. Never delete source `_prompt.json` / `_prompt.nosrc`.
+- First userPrompt only. Skip files without a `code` section C4 source body (and skip `_prompt.nosrc`).
+- Cluster key is `<path method_id>:<sha256 of canonical public/external function+event signatures>`. Events/state/call do not affect the key.
+- `qualityScore(hit)` is a hook; stub returns `1`. Per-cluster CAP keeps highest scores; ties keep the lexicographically first `relPath`.
+- Index only metadata after scoring — do not retain every userPrompt in memory.
+- `OUT` must not be `DATA_DIR` or a parent of it. A `train/` subdirectory under DATA_DIR is safe (`walkBuckets` ignores non-hex top-level names).
+
 ## Coding rules
 
 - Comments and public docs in **English**. JSDoc on exported functions: markdown in the description, only `@param` and `@return` as tags.
 - Prefer verifying Geth / explainer / SSZ field names in this repo or the explainer package over assuming they exist.
 - Keep the collector Docker-compatible: no `npm install` in `src/fetch_traces.mjs`.
-- New behavior needs a `node:test` case when it is pure (paths, filters, sim conversion, 2a/2b selection). Do not add tests that call live RPC or Sourcify.
-- Match existing style: no TypeScript, no extra frameworks, env vars for CLI config on collector/prepare, argv flags on query.
+- New behavior needs a `node:test` case when it is pure (paths, filters, sim conversion, 2a/2b selection, dedup fingerprints). Do not add tests that call live RPC or Sourcify.
+- Match existing style: no TypeScript, no extra frameworks, env vars for CLI config on collector/prepare/dedup, argv flags on query/dedup.
 
 ## Checks
 
@@ -88,7 +98,7 @@ The explainer lives **outside** this repo (`EXPLAINER_DIR`). Docker sets `SKIP_E
 npm test
 ```
 
-That is `node --test test/*.test.mjs`. Run it after layout, query, sim, or step-2a/2b changes.
+That is `node --test test/*.test.mjs`. Run it after layout, query, sim, step-2a/2b, or dedup changes.
 
 ## Out of scope unless asked
 

@@ -98,3 +98,33 @@ services:
       - /srv/node_exporter/textfile:/metrics
 
     mem_limit: 4g
+
+  # One-shot keep-set: cluster prompts by (method × Solidity interface) and
+  # copy at most CAP files per cluster to OUT. Does not start with `up`.
+  #   docker compose --profile dedup run --rm dedup
+  dedup:
+    build:
+      context: .
+      dockerfile: Dockerfile.dedup
+    image: colibri/trace-dedup:latest
+    container_name: trace-dedup
+    profiles: ["dedup"]
+    restart: "no"
+
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://193.26.158.2:3100/loki/api/v1/push"
+        loki-batch-size: "400"
+        loki-external-labels: "chain=mainnet,type=trace-dedup"
+
+    environment:
+      DATA_DIR: "/data/traces"
+      # Sibling of the hash shards; walkBuckets ignores non-[0-9a-f]{2} names.
+      OUT: "/data/traces/train"
+      CAP: "5"
+
+    volumes:
+      - /srv/trace-data:/data/traces
+
+    mem_limit: 1g

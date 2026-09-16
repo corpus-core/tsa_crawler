@@ -7,6 +7,7 @@ The pipeline is:
 1. **Collect** execution traces from a Geth node, sampled by contract bytecode and method.
 2. **Prepare** those traces into simulation JSON, then into two prompt styles (simple + detailed).
 3. **Query** the resulting prompts so you can inspect coverage and pick training examples.
+4. **Dedup** clusters similar contracts and copies a CAP-sized keep-set for training.
 
 ```
 Geth (eth + debug)
@@ -21,6 +22,7 @@ src/prepare-testdata.mjs  →  <txhash>_sim.json      (step 1: simulation shape)
         │
         ▼
 src/query.mjs             →  filter / dump prompts
+src/dedup.mjs             →  CAP keep-set under OUT (same layout)
 ```
 
 Requires **Node 18+** (Docker images use Node 22). No npm dependencies in this repo; the collector uses Node builtins only. Prompt generation needs the Colibri explainer from [colibri-stateless](https://github.com/corpus-core/colibri-stateless).
@@ -45,7 +47,7 @@ Traces and derived files live under `OUT` / `IN` / `DATA_DIR` (defaults: `./trac
 
 A **bucket** is `(codehash, selector)`. The collector stores at most `CAP` traces per bucket so the dataset stays diverse instead of filling up with the same `approve` on the same token.
 
-`traces/`, `test_data/`, and `sol_cache/` are gitignored.
+`traces/`, `test_data/`, `train_data/`, and `sol_cache/` are gitignored.
 
 ---
 
@@ -143,6 +145,30 @@ DATA_DIR=./test_data npm run query -- -q events:Approval -l 20
 
 ---
 
+## 4. Dedup — `src/dedup.mjs`
+
+Clusters `_prompt.json` files so similar contracts (e.g. ERC20 clones with different names/codehashes) share a bucket, then copies a CAP-sized keep-set to `OUT`. Only the first `userPrompt` is used. Matching is **path method id × public Solidity interface** (function/event signatures from the `code` section). `_prompt.nosrc` and prompts without a C4 source body are skipped. `DATA_DIR` is never modified.
+
+`qualityScore(hit)` is a hook (currently always `1`). When a cluster is over `CAP`, the lowest-scoring prompts are dropped; ties keep the lexicographically first `relPath`.
+
+```bash
+DATA_DIR=./test_data node src/dedup.mjs --dry-run
+DATA_DIR=./test_data OUT=./train_data CAP=5 node src/dedup.mjs
+DATA_DIR=./test_data npm run dedup -- --out ./train_data --keep 1
+```
+
+| Env / flag | Default | Meaning |
+| --- | --- | --- |
+| `DATA_DIR` | *(required)* | Prompt tree (read-only) |
+| `OUT` / `--out` | *(required unless `--dry-run`)* | Keep-set root; same sharding as `DATA_DIR` |
+| `CAP` / `--keep` | `5` | Max prompts per (method × interface) cluster |
+| `--dry-run` | | Stats only; no copy |
+| `-h` | | Help |
+
+`OUT` must not be `DATA_DIR` (or a parent of it). A subdirectory such as `DATA_DIR/train` is fine: `walkBuckets` ignores names that are not a 2-hex prefix. Each run overwrites previous keep-set `_prompt.json` files under `OUT` and writes `OUT/.dedup-manifest.json`.
+
+---
+
 ## Docker
 
 `docker-compose.yml` runs two long-lived services against host paths (`/srv/trace-data`, `/srv/trace-cache`, node_exporter textfiles):
@@ -151,8 +177,13 @@ DATA_DIR=./test_data npm run query -- -q events:Approval -l 20
 | --- | --- | --- |
 | `collector` | `Dockerfile.traces` | `src/fetch_traces.mjs`, host network so it can reach local Geth |
 | `prepare` | `Dockerfile.prepare` | `src/prepare-testdata.mjs` plus a built explainer; outbound HTTPS for Sourcify |
+| `dedup` | `Dockerfile.dedup` | One-shot `src/dedup.mjs`; profile `dedup`, does not start with `up` |
 
-They must **not** share a `PROM_FILE`. Compose host paths and Loki labels are environment-specific — edit them before `docker compose up`.
+```bash
+docker compose --profile dedup run --rm dedup
+```
+
+Dedup writes to `OUT=/data/traces/train` on the same volume. Collector and prepare must **not** share a `PROM_FILE`. Compose host paths and Loki labels are environment-specific — edit them before `docker compose up`.
 
 ---
 

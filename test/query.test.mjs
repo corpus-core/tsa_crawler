@@ -16,8 +16,11 @@ import {
     formatMatch,
     shouldUseColor,
     visitMatchingPrompts,
+    pageHits,
+    shuffleInPlace,
     simPathForPrompt,
     loadSimText,
+    hasTraceCall,
     main,
     HELP,
     SECTION_COLOR,
@@ -42,6 +45,14 @@ function writePrompt(root, txhash, userPrompt, extra = [], { hash = HASH, method
     return path.relative(root, file);
 }
 
+function writeTrace(root, txhash, body, { hash = HASH, method = 'ac9650d8' } = {}) {
+    const dir = path.join(root, hash.slice(0, 2), hash.slice(2), method);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${txhash}.json`);
+    fs.writeFileSync(file, JSON.stringify(body));
+    return path.relative(root, file);
+}
+
 describe('parseArgs', () => {
     it('parses flags', () => {
         assert.deepEqual(parseArgs(['-q', 'approve', '-min', '10', '-max', '99', '-d']), {
@@ -52,6 +63,9 @@ describe('parseArgs', () => {
             max: 99,
             details: true,
             sim: false,
+            random: false,
+            deleteTrace: false,
+            deleteSiblings: false,
             help: false,
         });
         assert.deepEqual(parseArgs(['-q', 'approve', '-q', 'spender']).q, [
@@ -62,12 +76,26 @@ describe('parseArgs', () => {
             { section: 'events', term: 'Approval' },
         ]);
         assert.equal(parseArgs(['-l', '3']).limit, 3);
-        assert.deepEqual(parseArgs(['-t']), {
+        assert.equal(parseArgs(['-o', '7']).offset, 7);
+        assert.equal(parseArgs(['-r']).random, true);
+        assert.equal(parseArgs(['-t', '0']).hasCall, false);
+        assert.equal(parseArgs(['-t', '1']).hasCall, true);
+        assert.equal(parseArgs(['-s']).sim, true);
+        assert.deepEqual(parseArgs(['-x']).deleteTrace, true);
+        assert.deepEqual(parseArgs(['-X']), {
+            q: [], c: [], m: [],
+            details: false, sim: false, random: false,
+            deleteTrace: true, deleteSiblings: true, help: false,
+        });
+        assert.deepEqual(parseArgs(['-s']), {
             q: [],
             c: [],
             m: [],
             details: true,
             sim: true,
+            random: false,
+            deleteTrace: false,
+            deleteSiblings: false,
             help: false,
         });
         assert.deepEqual(
@@ -78,6 +106,9 @@ describe('parseArgs', () => {
                 m: ['095ea7b3', 'fallback'],
                 details: false,
                 sim: false,
+                random: false,
+                deleteTrace: false,
+                deleteSiblings: false,
                 help: false,
             },
         );
@@ -94,7 +125,9 @@ describe('parseArgs', () => {
         assert.throws(() => parseArgs(['-max', 'nope']), /non-negative integer/);
         assert.throws(() => parseArgs(['-c', 'zz']), /hex codehash prefix/);
         assert.throws(() => parseArgs(['-m', 'approve']), /method id/);
-        assert.throws(() => parseArgs(['-x']), /unknown flag/);
+        assert.throws(() => parseArgs(['-t']), /requires 0 or 1/);
+        assert.throws(() => parseArgs(['-t', '2']), /requires 0 or 1/);
+        assert.throws(() => parseArgs(['-z']), /unknown flag/);
     });
 });
 
@@ -127,6 +160,16 @@ describe('firstUserPrompt', () => {
         assert.equal(firstUserPrompt([]), null);
         assert.equal(firstUserPrompt({}), null);
         assert.equal(firstUserPrompt([{ style: 'simple' }]), null);
+    });
+});
+
+describe('hasTraceCall', () => {
+    it('detects .trace.call on collector traces', () => {
+        assert.equal(hasTraceCall({ trace: { keccak: [], sstore: [] } }), false);
+        assert.equal(hasTraceCall({ trace: { call: { type: 'CALL' } } }), true);
+        assert.equal(hasTraceCall({ trace: { call: null } }), false);
+        assert.equal(hasTraceCall({}), false);
+        assert.equal(hasTraceCall(null), false);
     });
 });
 
@@ -212,6 +255,22 @@ describe('splitSections / colorizePrompt', () => {
         assert.equal(shouldUseColor({ isTTY: true }, {}), true);
         assert.equal(shouldUseColor({ isTTY: true }, { NO_COLOR: '1' }), false);
         assert.equal(shouldUseColor({ isTTY: false }, { FORCE_COLOR: '1' }), true);
+    });
+});
+
+describe('pageHits', () => {
+    const hits = ['a', 'b', 'c'];
+
+    it('offsets then limits, shuffle first when random', () => {
+        assert.deepEqual(pageHits(hits, { offset: 1 }), ['b', 'c']);
+        assert.deepEqual(pageHits(hits, { offset: 1, limit: 1 }), ['b']);
+        assert.deepEqual(pageHits(hits, { limit: 0 }), []);
+        assert.deepEqual(pageHits(hits, { random: true, rng: () => 0 }), ['b', 'c', 'a']);
+        assert.deepEqual(pageHits(hits, { random: true, offset: 1, limit: 1, rng: () => 0 }), ['c']);
+        const copy = hits.slice();
+        shuffleInPlace(copy, () => 0);
+        assert.deepEqual(copy, ['b', 'c', 'a']);
+        assert.deepEqual(hits, ['a', 'b', 'c']);
     });
 });
 
@@ -324,6 +383,47 @@ describe('visitMatchingPrompts', () => {
         visitMatchingPrompts(root, { limit: 0 }, (hit) => none.push(hit.relPath));
         assert.deepEqual(none, []);
     });
+
+    it('applies offset before limit, and shuffles before both when -r', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'query-'));
+        writePrompt(root, TX_A, 'ok');
+        writePrompt(root, TX_B, 'ok');
+        writePrompt(root, TX_C, 'ok');
+
+        const all = [];
+        visitMatchingPrompts(root, {}, (hit) => all.push(hit.relPath));
+        assert.equal(all.length, 3);
+
+        const skipped = [];
+        visitMatchingPrompts(root, { offset: 1, limit: 1 }, (hit) => skipped.push(hit.relPath));
+        assert.deepEqual(skipped, all.slice(1, 2));
+
+        const shuffled = [];
+        visitMatchingPrompts(root, { random: true, limit: 2, rng: () => 0 }, (hit) => shuffled.push(hit.relPath));
+        assert.deepEqual(
+            shuffled,
+            pageHits(all, { random: true, limit: 2, rng: () => 0 }),
+        );
+        assert.equal(shuffled.length, 2);
+        assert.ok(shuffled.includes(all[2]) || shuffled[0] !== all[0]);
+    });
+
+    it('filters collector traces by .trace.call (-t 0/1)', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'query-'));
+        const noCallPrompt = writePrompt(root, TX_A, 'ok');
+        writeTrace(root, TX_A, { trace: { keccak: [], sstore: [] } });
+        const withCallPrompt = writePrompt(root, TX_B, 'ok');
+        writeTrace(root, TX_B, { trace: { keccak: [], call: { type: 'CALL', from: '0x1' } } });
+        const noTracePrompt = writePrompt(root, TX_C, 'ok');
+
+        const missing = [];
+        visitMatchingPrompts(root, { hasCall: false }, (hit) => missing.push(hit.relPath));
+        assert.deepEqual(new Set(missing), new Set([noCallPrompt, noTracePrompt]));
+
+        const present = [];
+        visitMatchingPrompts(root, { hasCall: true }, (hit) => present.push(hit.relPath));
+        assert.deepEqual(present, [withCallPrompt]);
+    });
 });
 
 describe('main', () => {
@@ -385,14 +485,14 @@ describe('main', () => {
         assert.deepEqual(logs, []);
     });
 
-    it('prints sibling _sim.json with -t', () => {
+    it('prints sibling _sim.json with -s', () => {
         root = fs.mkdtempSync(path.join(os.tmpdir(), 'query-'));
         const rel = writePrompt(root, TX_A, 'Function: approve');
         const abs = path.join(root, rel);
         fs.writeFileSync(simPathForPrompt(abs), JSON.stringify({ status: '0x1', gasUsed: '0x10' }));
 
         const { logs, errors, io } = capture();
-        main({ DATA_DIR: root, FORCE_COLOR: '0' }, ['-t'], io);
+        main({ DATA_DIR: root, FORCE_COLOR: '0' }, ['-s'], io);
         assert.equal(errors.length, 0);
         assert.match(logs[0], /Function: approve/);
         assert.match(logs[0], /## Simulation/);
@@ -400,13 +500,52 @@ describe('main', () => {
         assert.equal(loadSimText(abs), '{\n  "status": "0x1",\n  "gasUsed": "0x10"\n}');
     });
 
-    it('warns when -t has no sibling sim file', () => {
+    it('warns when -s has no sibling sim file', () => {
         root = fs.mkdtempSync(path.join(os.tmpdir(), 'query-'));
         writePrompt(root, TX_A, 'Function: approve');
         const { logs, errors, io } = capture();
-        main({ DATA_DIR: root, FORCE_COLOR: '0' }, ['-t'], io);
+        main({ DATA_DIR: root, FORCE_COLOR: '0' }, ['-s'], io);
         assert.match(errors[0], /skip sim/);
         assert.match(logs[0], /Function: approve/);
         assert.equal(logs[0].includes('## Simulation'), false);
+    });
+
+    it('deletes only the collector trace with -x', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'query-'));
+        const rel = writePrompt(root, TX_A, 'ok');
+        const abs = path.join(root, rel);
+        const trace = abs.replace(/_prompt\.json$/, '.json');
+        const sim = abs.replace(/_prompt\.json$/, '_sim.json');
+        fs.writeFileSync(trace, JSON.stringify({ trace: { keccak: [] } }));
+        fs.writeFileSync(sim, '{}');
+
+        const { errors, io } = capture();
+        main({ DATA_DIR: root, PROGRESS_EVERY: '1' }, ['-t', '0', '-x'], io);
+        assert.equal(fs.existsSync(trace), false);
+        assert.equal(fs.existsSync(abs), true);
+        assert.equal(fs.existsSync(sim), true);
+        assert.match(errors.join('\n'), /delete: done 1 txs, 1 files/);
+    });
+
+    it('deletes siblings and prunes empty dirs with -X', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'query-'));
+        const rel = writePrompt(root, TX_A, 'ok');
+        const abs = path.join(root, rel);
+        const stem = abs.replace(/_prompt\.json$/, '');
+        fs.writeFileSync(`${stem}.json`, JSON.stringify({ trace: { keccak: [] } }));
+        fs.writeFileSync(`${stem}_sim.json`, '{}');
+        fs.writeFileSync(`${stem}_prompt.nosrc`, '{}\n');
+        fs.writeFileSync(`${stem}_sim.nosrc`, '{}\n');
+
+        const { errors, io } = capture();
+        main({ DATA_DIR: root }, ['-t', '0', '-X'], io);
+        assert.equal(fs.existsSync(`${stem}.json`), false);
+        assert.equal(fs.existsSync(abs), false);
+        assert.equal(fs.existsSync(`${stem}_sim.json`), false);
+        assert.equal(fs.existsSync(`${stem}_prompt.nosrc`), false);
+        assert.equal(fs.existsSync(`${stem}_sim.nosrc`), false);
+        assert.equal(fs.existsSync(path.join(root, HASH.slice(0, 2))), false);
+        assert.equal(fs.existsSync(root), true);
+        assert.match(errors.join('\n'), /delete: done 1 txs/);
     });
 });

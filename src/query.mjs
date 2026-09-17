@@ -7,7 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { walkBuckets, SELECTOR_DIR_RE } from './bucket_paths.mjs';
+import { walkBuckets, SELECTOR_DIR_RE, TRACE_FILE_RE } from './bucket_paths.mjs';
 
 export const PROMPT_FILE_RE = /^0x[0-9a-f]{64}_prompt\.json$/;
 
@@ -24,9 +24,16 @@ Options:
                       optional 0x prefix; repeatable as OR)
   -min <n>            Keep files whose first userPrompt is longer than n
   -max <n>            Keep files whose first userPrompt is shorter than n
+  -r                  Shuffle matches after filters (before -o / -l)
+  -o <n>              Skip the first n matches (after shuffle, before -l)
   -l <n>              Stop after n matches
   -d                  Print path and first userPrompt; color-code sections
-  -t                  Like -d, plus the sibling <txhash>_sim.json (light blue)
+  -s                  Like -d, plus the sibling <txhash>_sim.json (light blue)
+  -t <0|1>            Keep txs whose collector {txhash}.json has (.trace.call)
+                      (1) or does not (0)
+  -x                  Delete matching {txhash}.json files
+  -X                  Like -x, plus _sim.json, _prompt.json, _prompt.nosrc,
+                      _sim.nosrc; prune empty parent dirs
   -h, --help          Show this help
 `;
 
@@ -178,10 +185,14 @@ export function parseMethodId(val) {
 
 /**
  * @param {string[]} argv
- * @return {{ q: Array<{ term: string, section?: string }>, c: string[], m: string[], min?: number, max?: number, limit?: number, details: boolean, sim: boolean, help: boolean }}
+ * @return {{ q: Array<{ term: string, section?: string }>, c: string[], m: string[], min?: number, max?: number, limit?: number, offset?: number, random: boolean, details: boolean, sim: boolean, hasCall?: boolean, deleteTrace: boolean, deleteSiblings: boolean, help: boolean }}
  */
 export function parseArgs(argv) {
-    const filters = { q: [], c: [], m: [], details: false, sim: false, help: false };
+    const filters = {
+        q: [], c: [], m: [],
+        details: false, sim: false, random: false,
+        deleteTrace: false, deleteSiblings: false, help: false,
+    };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         if (a === '-h' || a === '--help') {
@@ -192,12 +203,33 @@ export function parseArgs(argv) {
             filters.details = true;
             continue;
         }
-        if (a === '-t') {
+        if (a === '-s') {
             filters.details = true;
             filters.sim = true;
             continue;
         }
-        if (a === '-q' || a === '-c' || a === '-m' || a === '-min' || a === '-max' || a === '-l') {
+        if (a === '-r') {
+            filters.random = true;
+            continue;
+        }
+        if (a === '-x') {
+            filters.deleteTrace = true;
+            continue;
+        }
+        if (a === '-X') {
+            filters.deleteTrace = true;
+            filters.deleteSiblings = true;
+            continue;
+        }
+        if (a === '-t') {
+            const val = argv[++i];
+            if (val !== '0' && val !== '1') {
+                throw new Error('-t requires 0 or 1');
+            }
+            filters.hasCall = val === '1';
+            continue;
+        }
+        if (a === '-q' || a === '-c' || a === '-m' || a === '-min' || a === '-max' || a === '-l' || a === '-o') {
             const val = argv[++i];
             if (val === undefined || val.startsWith('-')) {
                 throw new Error(`${a} requires a value`);
@@ -220,6 +252,7 @@ export function parseArgs(argv) {
             const n = Number(val);
             if (a === '-min') filters.min = n;
             else if (a === '-max') filters.max = n;
+            else if (a === '-o') filters.offset = n;
             else filters.limit = n;
             continue;
         }
@@ -281,6 +314,128 @@ export function simPathForPrompt(promptAbsPath) {
 }
 
 /**
+ * Collector trace sibling of a `_prompt.json` path.
+ *
+ * @param {string} promptAbsPath
+ * @return {string}
+ */
+export function tracePathForPrompt(promptAbsPath) {
+    return promptAbsPath.replace(/_prompt\.json$/, '.json');
+}
+
+/**
+ * True when the collector trace has a `.trace.call` property that is not null.
+ *
+ * @param {unknown} parsed
+ * @return {boolean}
+ */
+export function hasTraceCall(parsed) {
+    return parsed != null
+        && typeof parsed === 'object'
+        && parsed.trace != null
+        && typeof parsed.trace === 'object'
+        && parsed.trace.call != null;
+}
+
+/**
+ * @param {object} filters
+ * @return {boolean}
+ */
+function needsUserPrompt(filters) {
+    return (filters.q && filters.q.length > 0)
+        || filters.min !== undefined
+        || filters.max !== undefined
+        || filters.details
+        || filters.sim;
+}
+
+/**
+ * @param {string} dir
+ * @return {Map<string, { trace?: string, prompt?: string }>}
+ */
+function indexBucketFiles(dir) {
+    const byTx = new Map();
+    let names;
+    try {
+        names = fs.readdirSync(dir);
+    } catch {
+        return byTx;
+    }
+    for (const name of names) {
+        if (TRACE_FILE_RE.test(name)) {
+            const tx = name.slice(0, -'.json'.length);
+            const slot = byTx.get(tx) || {};
+            slot.trace = name;
+            byTx.set(tx, slot);
+        } else if (PROMPT_FILE_RE.test(name)) {
+            const tx = name.slice(0, -'_prompt.json'.length);
+            const slot = byTx.get(tx) || {};
+            slot.prompt = name;
+            byTx.set(tx, slot);
+        }
+    }
+    return byTx;
+}
+
+/**
+ * Unlink existing siblings. Missing files are ignored.
+ *
+ * @param {string} traceAbsPath
+ * @param {boolean} siblings
+ * @return {string[]} paths actually removed
+ */
+export function unlinkTxFiles(traceAbsPath, siblings) {
+    const stem = traceAbsPath.replace(/\.json$/, '');
+    const names = [traceAbsPath];
+    if (siblings) {
+        names.push(
+            `${stem}_sim.json`,
+            `${stem}_prompt.json`,
+            `${stem}_prompt.nosrc`,
+            `${stem}_sim.nosrc`,
+        );
+    }
+    const removed = [];
+    for (const p of names) {
+        try {
+            fs.unlinkSync(p);
+            removed.push(p);
+        } catch (e) {
+            if (e.code !== 'ENOENT') throw e;
+        }
+    }
+    return removed;
+}
+
+/**
+ * Remove `dir` and empty parents up to (but not including) `root`.
+ *
+ * @param {string} dir
+ * @param {string} root
+ * @return {string[]} directories removed
+ */
+export function pruneEmptyDirs(dir, root) {
+    const rootAbs = path.resolve(root);
+    let current = path.resolve(dir);
+    const removed = [];
+    while (true) {
+        const rel = path.relative(rootAbs, current);
+        if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) break;
+        let names;
+        try {
+            names = fs.readdirSync(current);
+        } catch {
+            break;
+        }
+        if (names.length > 0) break;
+        fs.rmdirSync(current);
+        removed.push(current);
+        current = path.dirname(current);
+    }
+    return removed;
+}
+
+/**
  * Pretty-printed sibling `_sim.json`, or null if missing/invalid.
  *
  * @param {string} promptAbsPath
@@ -313,7 +468,7 @@ export function loadSimText(promptAbsPath, onWarn) {
  * @return {string}
  */
 export function formatMatch(relPath, userPrompt, details, color = false, simText = null) {
-    if (!details) return relPath;
+    if (!details || typeof userPrompt !== 'string') return relPath;
     const body = color ? colorizePrompt(userPrompt) : userPrompt;
     let out = `=== ${relPath} ===\n${body}`;
     if (simText != null) {
@@ -326,48 +481,136 @@ export function formatMatch(relPath, userPrompt, details, color = false, simText
 const STOP = Symbol('limit');
 
 /**
- * Stream matching prompt files. Does not collect all paths first.
+ * Fisher-Yates. `rng` must return a float in [0, 1).
+ *
+ * @param {unknown[]} arr
+ * @param {() => number} [rng]
+ * @return {unknown[]}
+ */
+export function shuffleInPlace(arr, rng = Math.random) {
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1));
+        const tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+    }
+    return arr;
+}
+
+/**
+ * Shuffle (optional), then offset, then limit.
+ *
+ * @param {unknown[]} hits
+ * @param {{ random?: boolean, offset?: number, limit?: number, rng?: () => number }} [opts]
+ * @return {unknown[]}
+ */
+export function pageHits(hits, { random = false, offset = 0, limit, rng = Math.random } = {}) {
+    const out = random ? shuffleInPlace(hits.slice(), rng) : hits;
+    const start = offset || 0;
+    if (limit === 0) return [];
+    if (limit === undefined) return start ? out.slice(start) : (random ? out : hits);
+    return out.slice(start, start + limit);
+}
+
+/**
+ * @param {string} root
+ * @param {object} filters
+ * @param {(hit: { relPath: string, absPath: string, userPrompt: string }) => void} onHit
+ * @param {(msg: string) => void} [onWarn]
+ */
+function forEachMatching(root, filters, onHit, onWarn) {
+    const wantCall = filters.hasCall;
+    const requirePrompt = needsUserPrompt(filters) || wantCall === undefined;
+    walkBuckets(root, (dir, key) => {
+        const bucket = key.match(BUCKET_KEY_RE);
+        if (!bucket || !matchesBucket(bucket[1], bucket[2], filters)) return;
+        const byTx = indexBucketFiles(dir);
+        for (const [, files] of byTx) {
+            const promptAbs = files.prompt ? path.join(dir, files.prompt) : null;
+            const traceAbs = files.trace
+                ? path.join(dir, files.trace)
+                : (promptAbs ? tracePathForPrompt(promptAbs) : null);
+
+            if (wantCall !== undefined) {
+                let parsed = null;
+                if (files.trace) {
+                    try {
+                        parsed = JSON.parse(fs.readFileSync(traceAbs, 'utf8'));
+                    } catch (e) {
+                        onWarn?.(`warn: skip ${traceAbs}: ${e.message}`);
+                        parsed = null;
+                    }
+                }
+                if (hasTraceCall(parsed) !== wantCall) continue;
+            } else if (!files.prompt) {
+                continue;
+            }
+
+            let userPrompt = null;
+            if (requirePrompt) {
+                if (!promptAbs) continue;
+                let parsedPrompt;
+                try {
+                    parsedPrompt = JSON.parse(fs.readFileSync(promptAbs, 'utf8'));
+                } catch (e) {
+                    onWarn?.(`warn: skip ${promptAbs}: ${e.message}`);
+                    continue;
+                }
+                userPrompt = firstUserPrompt(parsedPrompt);
+                if (userPrompt === null) {
+                    onWarn?.(`warn: skip ${promptAbs}: missing userPrompt`);
+                    continue;
+                }
+                if (!matchesFilters(userPrompt, filters)) continue;
+            }
+
+            const absPath = promptAbs || traceAbs;
+            onHit({
+                relPath: path.relative(root, absPath),
+                absPath,
+                traceAbsPath: traceAbs,
+                userPrompt,
+            });
+        }
+    });
+}
+
+/**
+ * Stream matching prompt files. `-r` collects the full filtered set, shuffles,
+ * then applies `-o` and `-l`. Without `-r`, offset/limit stream in walk order.
  *
  * @param {string} root
- * @param {{ q?: Array<string | { term: string, section?: string }>, c?: string[], m?: string[], min?: number, max?: number, limit?: number }} filters
+ * @param {{ q?: Array<string | { term: string, section?: string }>, c?: string[], m?: string[], min?: number, max?: number, limit?: number, offset?: number, random?: boolean, rng?: () => number }} filters
  * @param {(hit: { relPath: string, absPath: string, userPrompt: string }) => void} onMatch
  * @param {(msg: string) => void} [onWarn]
  */
 export function visitMatchingPrompts(root, filters, onMatch, onWarn) {
     const limit = filters.limit;
     if (limit === 0) return;
-    let hits = 0;
+    const offset = filters.offset || 0;
+    const rng = filters.rng || Math.random;
+
+    if (filters.random) {
+        const hits = [];
+        forEachMatching(root, filters, (hit) => hits.push(hit), onWarn);
+        for (const hit of pageHits(hits, { random: true, offset, limit, rng })) {
+            onMatch(hit);
+        }
+        return;
+    }
+
+    let skipped = 0;
+    let emitted = 0;
     try {
-        walkBuckets(root, (dir, key) => {
-            const bucket = key.match(BUCKET_KEY_RE);
-            if (!bucket || !matchesBucket(bucket[1], bucket[2], filters)) return;
-            let names;
-            try {
-                names = fs.readdirSync(dir);
-            } catch {
+        forEachMatching(root, filters, (hit) => {
+            if (skipped < offset) {
+                skipped++;
                 return;
             }
-            for (const name of names) {
-                if (!PROMPT_FILE_RE.test(name)) continue;
-                const absPath = path.join(dir, name);
-                let parsed;
-                try {
-                    parsed = JSON.parse(fs.readFileSync(absPath, 'utf8'));
-                } catch (e) {
-                    onWarn?.(`warn: skip ${absPath}: ${e.message}`);
-                    continue;
-                }
-                const userPrompt = firstUserPrompt(parsed);
-                if (userPrompt === null) {
-                    onWarn?.(`warn: skip ${absPath}: missing userPrompt`);
-                    continue;
-                }
-                if (!matchesFilters(userPrompt, filters)) continue;
-                onMatch({ relPath: path.relative(root, absPath), absPath, userPrompt });
-                hits++;
-                if (limit !== undefined && hits >= limit) throw STOP;
-            }
-        });
+            onMatch(hit);
+            emitted++;
+            if (limit !== undefined && emitted >= limit) throw STOP;
+        }, onWarn);
     } catch (e) {
         if (e !== STOP) throw e;
     }
@@ -408,15 +651,31 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
     }
 
     const color = (filters.details || filters.sim) && shouldUseColor(process.stdout, env);
+    const progressEvery = parseInt(env.PROGRESS_EVERY || '100', 10) || 100;
+    let deletedTxs = 0;
+    let deletedFiles = 0;
+    let deletedDirs = 0;
     visitMatchingPrompts(
         dataDir,
         filters,
-        ({ relPath, absPath, userPrompt }) => {
+        ({ relPath, absPath, traceAbsPath, userPrompt }) => {
             const simText = filters.sim ? loadSimText(absPath, (msg) => io.error(msg)) : null;
             io.log(formatMatch(relPath, userPrompt, filters.details, color, simText));
+            if (!filters.deleteTrace || !traceAbsPath) return;
+            const removed = unlinkTxFiles(traceAbsPath, filters.deleteSiblings);
+            deletedFiles += removed.length;
+            const dirs = pruneEmptyDirs(path.dirname(traceAbsPath), dataDir);
+            deletedDirs += dirs.length;
+            deletedTxs++;
+            if (deletedTxs % progressEvery === 0) {
+                io.error(`delete: ${deletedTxs} txs (${deletedFiles} files, ${deletedDirs} dirs)`);
+            }
         },
         (msg) => io.error(msg),
     );
+    if (filters.deleteTrace) {
+        io.error(`delete: done ${deletedTxs} txs, ${deletedFiles} files, ${deletedDirs} dirs`);
+    }
 }
 
 const isMain = process.argv[1]

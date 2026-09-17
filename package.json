@@ -4,8 +4,8 @@
     "scripts": {
         "fetch-traces": "node src/fetch_traces.mjs",
         "prepare-testdata": "node src/prepare-testdata.mjs",
-        "query": "node src/query.mjs",
         "dedup": "node src/dedup.mjs",
+        "query": "node src/query.mjs",
         "test": "node --test test/*.test.mjs"
     }
 }

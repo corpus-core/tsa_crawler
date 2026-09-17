@@ -359,7 +359,7 @@ async function step2(traceFile, explainer) {
         },
         {
             style: 'detailed',
-            ...explainer.buildPrompt(sim, txParams, { systemPrompt: DETAILED_SYSTEM_PROMPT }, context),
+            ...explainer.buildPrompt(sim, txParams, { systemPrompt: DETAILED_SYSTEM_PROMPT, maxSourceChars: 0 }, context),
         },
     ], true);
     return 'ok';

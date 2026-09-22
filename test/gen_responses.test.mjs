@@ -20,6 +20,7 @@ import {
     writeResponseEntry,
     runPool,
     formatSummary,
+    formatMetrics,
     main,
     HELP,
     DEFAULT_MODEL,
@@ -310,7 +311,7 @@ describe('callDeepSeek', () => {
             baseUrl: 'https://x', apiKey: 'k', timeoutMs: 100, maxRetries: 3,
         }, {
             fetch: async () => { calls++; return { ok: false, status: 400, async text() { return 'bad'; } }; },
-            sleep: async () => {},
+            sleep: async () => { },
             rng: () => 0.5,
         }), /HTTP 400/);
         assert.equal(calls, 1);
@@ -322,7 +323,7 @@ describe('callDeepSeek', () => {
             baseUrl: 'https://x', apiKey: 'k', timeoutMs: 100, maxRetries: 2,
         }, {
             fetch: async () => { calls++; return { ok: false, status: 503, async text() { return 'down'; } }; },
-            sleep: async () => {},
+            sleep: async () => { },
             rng: () => 0.5,
         }), /HTTP 503/);
         assert.equal(calls, 3);
@@ -383,8 +384,11 @@ describe('main', () => {
         writePrompt(root, TX_A);
         writePrompt(root, TX_B, { hash: HASH_B });
         const cap = capture();
-        await main({ DATA_DIR: root }, ['--dry-run'], cap.io);
+        const prom = path.join(root, 'gen.prom');
+        await main({ DATA_DIR: root, PROM_FILE: prom, CHAIN: 'sepolia' }, ['--dry-run'], cap.io);
         assert.equal(process.exitCode, undefined);
+        assert.match(fs.readFileSync(prom, 'utf8'), /trace_gen_planned\{chain="sepolia"\} 2/);
+        assert.match(fs.readFileSync(prom, 'utf8'), /trace_gen_dry_run\{chain="sepolia"\} 1/);
         const out = cap.logs.join('\n');
         assert.match(out, /2 candidate prompt-style pairs/);
         assert.match(out, /planned calls: 2/);
@@ -406,7 +410,7 @@ describe('main', () => {
             return mockOkResponse({ content: 'answer', promptTokens: 200, completionTokens: 50 });
         };
         const cap = capture();
-        await main({ DATA_DIR: root, DEEPSEEK_API_KEY: 'k', CONCURRENCY: '1', PROGRESS_EVERY: '0' }, [], cap.io, { fetch: fakeFetch, sleep: async () => {}, rng: () => 0.5, now: () => 1_000 });
+        await main({ DATA_DIR: root, DEEPSEEK_API_KEY: 'k', CONCURRENCY: '1', PROGRESS_EVERY: '0' }, [], cap.io, { fetch: fakeFetch, sleep: async () => { }, rng: () => 0.5, now: () => 1_000 });
         assert.equal(process.exitCode, undefined);
         assert.equal(calls, 1);
         const resp = JSON.parse(fs.readFileSync(responsePathForPrompt(prompt), 'utf8'));
@@ -419,14 +423,14 @@ describe('main', () => {
         // Second run must skip.
         cap.logs.length = 0; cap.errors.length = 0;
         calls = 0;
-        await main({ DATA_DIR: root, DEEPSEEK_API_KEY: 'k', CONCURRENCY: '1' }, [], cap.io, { fetch: fakeFetch, sleep: async () => {} });
+        await main({ DATA_DIR: root, DEEPSEEK_API_KEY: 'k', CONCURRENCY: '1' }, [], cap.io, { fetch: fakeFetch, sleep: async () => { } });
         assert.equal(calls, 0);
         assert.match(cap.logs.join('\n'), /skipped:\s+1/);
 
         // FORCE overrides.
         cap.logs.length = 0;
         calls = 0;
-        await main({ DATA_DIR: root, DEEPSEEK_API_KEY: 'k', CONCURRENCY: '1', FORCE: '1' }, [], cap.io, { fetch: fakeFetch, sleep: async () => {} });
+        await main({ DATA_DIR: root, DEEPSEEK_API_KEY: 'k', CONCURRENCY: '1', FORCE: '1' }, [], cap.io, { fetch: fakeFetch, sleep: async () => { } });
         assert.equal(calls, 1);
     });
 
@@ -438,7 +442,7 @@ describe('main', () => {
         const cap = capture();
         await main({ DATA_DIR: root, DEEPSEEK_API_KEY: 'k', CONCURRENCY: '1' }, ['--limit', '1'], cap.io, {
             fetch: async () => { calls++; return mockOkResponse(); },
-            sleep: async () => {},
+            sleep: async () => { },
         });
         assert.equal(calls, 1);
     });
@@ -453,7 +457,7 @@ describe('main', () => {
                 async json() { return { id: 'x', choices: [{ finish_reason: 'length', message: { content: 'partial' } }] }; },
                 async text() { return ''; },
             }),
-            sleep: async () => {},
+            sleep: async () => { },
         });
         assert.equal(process.exitCode, 1);
         assert.equal(fs.existsSync(responsePathForPrompt(prompt)), false);
@@ -471,5 +475,18 @@ describe('formatSummary', () => {
             formatSummary({ ok: 2, skipped: 1, failed: 0, tokensIn: 400, tokensOut: 80, cacheHit: 100, cacheMiss: 300 }),
             /prompt tokens: 400/,
         );
+    });
+
+    it('formatMetrics renders last-run gauges', () => {
+        const body = formatMetrics({
+            ok: 6, skipped: 2617, failed: 0, tokensIn: 34280, tokensOut: 56764,
+            cacheHit: 33920, cacheMiss: 360, lastRunTs: 1700000000,
+        }, 'mainnet');
+        assert.match(body, /trace_gen_ok\{chain="mainnet"\} 6/);
+        assert.match(body, /trace_gen_skipped\{chain="mainnet"\} 2617/);
+        assert.match(body, /trace_gen_prompt_tokens\{chain="mainnet"\} 34280/);
+        assert.match(body, /trace_gen_planned\{chain="mainnet"\} 6/);
+        assert.match(body, /trace_gen_dry_run\{chain="mainnet"\} 0/);
+        assert.equal(body.endsWith('\n'), true);
     });
 });

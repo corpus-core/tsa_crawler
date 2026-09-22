@@ -21,7 +21,7 @@ All runnable code lives in `src/`. Tests stay in `test/` and import from `../src
 | `src/bucket_paths.mjs` | **Single source of truth** for on-disk layout. |
 | `src/proxy_accesslist.mjs` | Access list + proxy implementation resolution. |
 | `src/sim-from-trace.mjs` | Collector file → Colibri simulation JSON. |
-| `Dockerfile.traces` / `Dockerfile.prepare` / `Dockerfile.dedup` / `Dockerfile.gen_responses` / `Dockerfile.validate_responses` / `Dockerfile.build_dataset` | COPY the needed `src/*.mjs` files into `/app` (flattened). Collector, dedup, gen-responses, validate-responses, and build-dataset are alpine+node only. Prepare sparse-checkouts the explainer. Dedup copies `dedup.mjs`, `query.mjs`, `bucket_paths.mjs`. Gen-responses copies `gen_responses.mjs`, `query.mjs`, `bucket_paths.mjs`. Validate-responses copies those three plus `validate_responses.mjs`. Build-dataset copies `build_dataset.mjs`, `dedup.mjs`, `gen_responses.mjs`, `validate_responses.mjs`, `export_dataset.mjs`, `query.mjs`, `bucket_paths.mjs`. |
+| `Dockerfile.traces` / `Dockerfile.prepare` / `Dockerfile.dedup` / `Dockerfile.gen_responses` / `Dockerfile.validate_responses` / `Dockerfile.build_dataset` | COPY the needed `src/*.mjs` files into `/app` (flattened). Collector, dedup, gen-responses, validate-responses, and build-dataset are alpine+node only. Prepare sparse-checkouts the explainer. Dedup copies `dedup.mjs`, `query.mjs`, `bucket_paths.mjs`, `prom_file.mjs`. Gen-responses copies `gen_responses.mjs`, `query.mjs`, `bucket_paths.mjs`, `prom_file.mjs`. Validate-responses copies those plus `validate_responses.mjs`. Build-dataset copies `build_dataset.mjs`, `dedup.mjs`, `gen_responses.mjs`, `validate_responses.mjs`, `export_dataset.mjs`, `query.mjs`, `bucket_paths.mjs`, `prom_file.mjs`. |
 | `test/*.test.mjs` | `node:test`. No network. Use temp dirs. |
 
 Everything is ESM (`.mjs`). Docker images do not use `package.json` `"type": "module"`; the `.mjs` suffix is enough.
@@ -95,7 +95,7 @@ The explainer lives **outside** this repo (`EXPLAINER_DIR`). Docker sets `SKIP_E
 - Index only metadata after scoring — do not retain every userPrompt in memory.
 - `OUT` must not be `DATA_DIR` or a parent of it. A `train/` subdirectory under DATA_DIR is safe (`walkBuckets` ignores non-hex top-level names).
 - Keep-set copy: `_prompt.json` plus sibling `_sim.json` when present. Do not copy collector traces. Missing sims are skipped. Do not delete `_response.json` / `_validation.json`.
-- Prometheus: own `PROM_FILE` per process **and** chain. Write after every completed run (including `--dry-run`); skip help / early validation errors. Atomic `*.tmp` + rename.
+- Prometheus: own `PROM_FILE` per process **and** chain. Write after every completed run (including `--dry-run`); skip help / early validation errors. Atomic `*.tmp` + rename. The file is shared with gen and validate: `writePromSection` replaces only the `trace_dedup_` metrics.
 
 ## Build-pipeline invariants (`src/build_dataset.mjs`)
 
@@ -115,6 +115,7 @@ The explainer lives **outside** this repo (`EXPLAINER_DIR`). Docker sets `SKIP_E
 - Retry only 429, 5xx, and network/timeout errors, with full-jitter exponential backoff bounded at 30s. `AbortController` enforces `TIMEOUT_MS` per attempt.
 - `fetch`, `sleep`, `rng`, and `now` are injectable through `main`'s `deps` argument. All tests use mocks; no live DeepSeek call is ever made from `node:test`.
 - Atomic writes: `.tmp` + `rename` in `writeResponseEntry`.
+- Prometheus: after a completed run (including `--dry-run`), write `trace_gen_*` gauges into `PROM_FILE` via `writePromSection`. Last run only; a regen pass replaces the previous gen section.
 
 ## Validation invariants (`src/validate_responses.mjs`)
 
@@ -129,6 +130,7 @@ The explainer lives **outside** this repo (`EXPLAINER_DIR`). Docker sets `SKIP_E
 - No API key is needed when `JUDGE_SAMPLE_PCT=0` or nothing is planned; the run fails **before** writing anything if judge calls are planned without `DEEPSEEK_API_KEY`. `LIMIT` caps judge calls; capped txs keep their deterministic result with `judge: null` and are picked up next run.
 - HTTP, retry, backoff, and pool come from `gen_responses.mjs` (`callDeepSeek`, `runPool`); do not duplicate them. `fetch`, `sleep`, `rng`, `now` are injectable via `main`'s `deps`. Tests never call the network.
 - Exit code 1 only when a judge call failed after retries; deterministic results for that tx are still written.
+- Prometheus: after a completed run (including `--dry-run`), write `trace_validate_*` gauges into the same `PROM_FILE`. Verdicts, mean ratio, and `trace_validate_judge_score` cover every scanned pair (reused judge results included). `judge_ok` / `judge_failed` / token gauges count only API calls of this run. A regen pass replaces the section.
 
 ## Export invariants (`src/export_dataset.mjs`)
 

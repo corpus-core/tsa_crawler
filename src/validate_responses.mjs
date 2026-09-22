@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { walkBuckets } from './bucket_paths.mjs';
+import { escapeLabel, writePromSection } from './prom_file.mjs';
 import {
     readResponse,
     readValidation,
@@ -781,6 +782,105 @@ export function formatSummary(s) {
 }
 
 /**
+ * Prometheus textfile for the last completed validation pass.
+ *
+ * Verdicts, the mean ratio, and `judge_score` describe every pair scanned,
+ * including fresh checks whose judge result was reused. `judge_ok`,
+ * `judge_failed`, and the token gauges count only API calls made in this run.
+ *
+ * @param {{ pairs: number, processed: number, skipped: number, detRecomputed: number, verdicts: Record<string, number>, ratioSum: number, ratioCount: number, judgePlanned: number, judgeOk: number, judgeFailed: number, judgeHist?: Record<string, number>, judgeTokensIn: number, judgeTokensOut: number, dryRun?: boolean, lastRunTs: number }} stats
+ * @param {string} [chain]
+ * @return {string}
+ */
+export function formatMetrics(stats, chain = 'mainnet') {
+    const labels = `{chain="${escapeLabel(chain)}"}`;
+    const hist = stats.judgeHist || {};
+    const mean = stats.ratioCount ? stats.ratioSum / stats.ratioCount : 0;
+    const lines = [
+        '# HELP trace_validate_pairs Prompt/response pairs scanned in the last run.',
+        '# TYPE trace_validate_pairs gauge',
+        `trace_validate_pairs${labels} ${stats.pairs}`,
+        '# HELP trace_validate_processed Pairs that needed a write in the last run.',
+        '# TYPE trace_validate_processed gauge',
+        `trace_validate_processed${labels} ${stats.processed}`,
+        '# HELP trace_validate_skipped Pairs whose check was already fresh in the last run.',
+        '# TYPE trace_validate_skipped gauge',
+        `trace_validate_skipped${labels} ${stats.skipped}`,
+        '# HELP trace_validate_recomputed Deterministic checks recomputed in the last run.',
+        '# TYPE trace_validate_recomputed gauge',
+        `trace_validate_recomputed${labels} ${stats.detRecomputed}`,
+        '# HELP trace_validate_verdict Grounding verdicts across every scanned pair.',
+        '# TYPE trace_validate_verdict gauge',
+    ];
+    for (const verdict of ['pass', 'warn', 'fail']) {
+        lines.push(`trace_validate_verdict{chain="${escapeLabel(chain)}",verdict="${verdict}"} ${stats.verdicts?.[verdict] || 0}`);
+    }
+    lines.push(
+        '# HELP trace_validate_mean_ratio Mean grounding ratio across scanned pairs (0 when none).',
+        '# TYPE trace_validate_mean_ratio gauge',
+        `trace_validate_mean_ratio${labels} ${gaugeNumber(mean)}`,
+        '# HELP trace_validate_judge_planned Judge calls planned in the last run.',
+        '# TYPE trace_validate_judge_planned gauge',
+        `trace_validate_judge_planned${labels} ${stats.judgePlanned}`,
+        '# HELP trace_validate_judge_ok Judge calls that returned in the last run.',
+        '# TYPE trace_validate_judge_ok gauge',
+        `trace_validate_judge_ok${labels} ${stats.judgeOk || 0}`,
+        '# HELP trace_validate_judge_failed Judge calls that failed after retries in the last run.',
+        '# TYPE trace_validate_judge_failed gauge',
+        `trace_validate_judge_failed${labels} ${stats.judgeFailed || 0}`,
+        '# HELP trace_validate_judge_score Judge scores on disk after the last run, including reused results.',
+        '# TYPE trace_validate_judge_score gauge',
+    );
+    for (const score of ['1', '2', '3', '4', '5', 'unparseable']) {
+        lines.push(`trace_validate_judge_score{chain="${escapeLabel(chain)}",score="${score}"} ${hist[score] || 0}`);
+    }
+    lines.push(
+        '# HELP trace_validate_judge_prompt_tokens Judge prompt tokens in the last run.',
+        '# TYPE trace_validate_judge_prompt_tokens gauge',
+        `trace_validate_judge_prompt_tokens${labels} ${stats.judgeTokensIn || 0}`,
+        '# HELP trace_validate_judge_output_tokens Judge completion tokens in the last run.',
+        '# TYPE trace_validate_judge_output_tokens gauge',
+        `trace_validate_judge_output_tokens${labels} ${stats.judgeTokensOut || 0}`,
+        '# HELP trace_validate_dry_run 1 if the last run was --dry-run.',
+        '# TYPE trace_validate_dry_run gauge',
+        `trace_validate_dry_run${labels} ${stats.dryRun ? 1 : 0}`,
+        '# HELP trace_validate_last_run_timestamp Unix time of the last completed validation pass.',
+        '# TYPE trace_validate_last_run_timestamp gauge',
+        `trace_validate_last_run_timestamp${labels} ${stats.lastRunTs}`,
+        '',
+    );
+    return lines.join('\n');
+}
+
+function gaugeNumber(n) {
+    if (!Number.isFinite(n)) return '0';
+    return String(Math.round(n * 1e6) / 1e6);
+}
+
+/**
+ * @param {string} promFile
+ * @param {object} stats
+ * @param {{ chain?: string, onError?: (msg: string) => void }} [opts]
+ */
+export function writeMetrics(promFile, stats, opts = {}) {
+    writePromSection(promFile, formatMetrics(stats, opts.chain || 'mainnet'), 'trace_validate_', opts);
+}
+
+/**
+ * Score bucket for a stored judge entry. Missing or out-of-range scores
+ * count as `unparseable`.
+ *
+ * @param {object | null | undefined} judge
+ * @return {string | null}
+ */
+function judgeScoreBucket(judge) {
+    if (!judge || typeof judge !== 'object') return null;
+    const score = judge.score;
+    if (Number.isInteger(score) && score >= 1 && score <= 5) return String(score);
+    return 'unparseable';
+}
+
+/**
  * Keep the ten weakest entries (lowest judge score first, then lowest ratio).
  *
  * @param {Array<{ ratio: number, judgeScore: number | null }>} list
@@ -837,7 +937,13 @@ export async function main(env = process.env, argv = process.argv.slice(2), io =
         pairs: pairs.length, processed: 0, skipped: 0, detRecomputed: 0,
         verdicts: { pass: 0, warn: 0, fail: 0 }, ratioSum: 0, ratioCount: 0,
         judgePlanned: 0, judgeOk: 0, judgeFailed: 0, judgeScores: {},
+        judgeHist: {},
         judgeTokensIn: 0, judgeTokensOut: 0, worst: [], estJudgeTokens: 0,
+    };
+    const tallyJudge = (judge) => {
+        const bucket = judgeScoreBucket(judge);
+        if (!bucket) return;
+        stats.judgeHist[bucket] = (stats.judgeHist[bucket] || 0) + 1;
     };
     const worstCandidates = [];
 
@@ -866,6 +972,7 @@ export async function main(env = process.env, argv = process.argv.slice(2), io =
         const needsWrite = work.recomputeDeterministic || work.runJudge;
         if (!needsWrite) {
             stats.skipped++;
+            tallyJudge(existingCheck?.judge);
             worstCandidates.push(toWorst(pair, deterministic, existingCheck?.judge));
             continue;
         }
@@ -880,7 +987,10 @@ export async function main(env = process.env, argv = process.argv.slice(2), io =
     if (flags.dryRun) {
         if (cfg.limit !== undefined) stats.judgePlanned = Math.min(stats.judgePlanned, cfg.limit);
         stats.worst = pickWorst(worstCandidates.concat(jobs.map((j) => toWorst(j.pair, j.deterministic, j.existingCheck?.judge))));
-        io.log(formatSummary({ ...stats, dryRun: true }));
+        for (const job of jobs) tallyJudge(job.existingCheck?.judge);
+        const summary = { ...stats, dryRun: true };
+        io.log(formatSummary(summary));
+        publishValidateMetrics(env, io, summary, now);
         return;
     }
 
@@ -908,6 +1018,7 @@ export async function main(env = process.env, argv = process.argv.slice(2), io =
             // Limit hit: keep the deterministic result, leave judge for a later run.
             judge = work.reuseJudge;
         }
+        tallyJudge(judge);
         const check = {
             checkedAt: new Date(now()).toISOString(),
             responseModel: pair.responseModel,
@@ -927,7 +1038,15 @@ export async function main(env = process.env, argv = process.argv.slice(2), io =
 
     stats.worst = pickWorst(worstCandidates);
     io.log(formatSummary(stats));
+    publishValidateMetrics(env, io, stats, now);
     if (stats.judgeFailed > 0) process.exitCode = 1;
+}
+
+function publishValidateMetrics(env, io, summary, now) {
+    writeMetrics(env.PROM_FILE || '', { ...summary, lastRunTs: Math.floor(now() / 1000) }, {
+        chain: env.CHAIN || 'mainnet',
+        onError: (msg) => io.error(msg),
+    });
 }
 
 async function runJudge(pair, cfg, deps, now, io, stats) {

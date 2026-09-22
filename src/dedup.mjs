@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { walkBuckets } from './bucket_paths.mjs';
+import { escapeLabel, writePromSection } from './prom_file.mjs';
 import {
     PROMPT_FILE_RE,
     firstUserPrompt,
@@ -537,18 +538,12 @@ export function formatMetrics(stats, chain = 'mainnet') {
  * @param {{ chain?: string, onError?: (msg: string) => void }} [opts]
  */
 export function writeMetrics(promFile, stats, opts = {}) {
-    if (!promFile) return;
-    try {
-        const tmp = promFile + '.tmp';
-        fs.writeFileSync(tmp, formatMetrics(stats, opts.chain || 'mainnet'));
-        fs.renameSync(tmp, promFile);
-    } catch (e) {
-        opts.onError?.(`metrics-error: ${e.message}`);
-    }
-}
-
-function escapeLabel(v) {
-    return String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+    writePromSection(
+        promFile,
+        formatMetrics(stats, opts.chain || 'mainnet'),
+        'trace_dedup_',
+        opts,
+    );
 }
 
 export function main(env = process.env, argv = process.argv.slice(2), io = console, opts = {}) {

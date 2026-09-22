@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { walkBuckets } from './bucket_paths.mjs';
+import { escapeLabel, writePromSection } from './prom_file.mjs';
 import { PROMPT_FILE_RE, responsePathForPrompt } from './query.mjs';
 
 // Canonical path helper lives in query.mjs (shared with the read-only tools).
@@ -480,6 +481,61 @@ export function formatSummary(stats) {
 }
 
 /**
+ * Prometheus textfile for the last completed gen pass. Gauges, not counters:
+ * the textfile collector replaces the file on every scrape.
+ *
+ * @param {{ ok: number, skipped: number, failed: number, tokensIn: number, tokensOut: number, cacheHit: number, cacheMiss: number, planned?: number, dryRun?: boolean, lastRunTs: number }} stats
+ * @param {string} [chain]
+ * @return {string}
+ */
+export function formatMetrics(stats, chain = 'mainnet') {
+    const labels = `{chain="${escapeLabel(chain)}"}`;
+    const planned = stats.dryRun ? (stats.planned ?? 0) : (stats.ok + stats.failed);
+    return [
+        '# HELP trace_gen_ok Teacher answers written in the last run.',
+        '# TYPE trace_gen_ok gauge',
+        `trace_gen_ok${labels} ${stats.ok}`,
+        '# HELP trace_gen_skipped Prompt-style pairs already fresh in the last run.',
+        '# TYPE trace_gen_skipped gauge',
+        `trace_gen_skipped${labels} ${stats.skipped}`,
+        '# HELP trace_gen_failed Teacher calls that failed after retries in the last run.',
+        '# TYPE trace_gen_failed gauge',
+        `trace_gen_failed${labels} ${stats.failed}`,
+        '# HELP trace_gen_planned Calls that would be made (dry-run) or were attempted (live).',
+        '# TYPE trace_gen_planned gauge',
+        `trace_gen_planned${labels} ${planned}`,
+        '# HELP trace_gen_prompt_tokens Prompt tokens reported by the API in the last run (estimated on dry-run).',
+        '# TYPE trace_gen_prompt_tokens gauge',
+        `trace_gen_prompt_tokens${labels} ${stats.tokensIn}`,
+        '# HELP trace_gen_output_tokens Completion tokens reported by the API in the last run.',
+        '# TYPE trace_gen_output_tokens gauge',
+        `trace_gen_output_tokens${labels} ${stats.tokensOut}`,
+        '# HELP trace_gen_cache_hit_tokens Prompt-cache hit tokens in the last run.',
+        '# TYPE trace_gen_cache_hit_tokens gauge',
+        `trace_gen_cache_hit_tokens${labels} ${stats.cacheHit}`,
+        '# HELP trace_gen_cache_miss_tokens Prompt-cache miss tokens in the last run.',
+        '# TYPE trace_gen_cache_miss_tokens gauge',
+        `trace_gen_cache_miss_tokens${labels} ${stats.cacheMiss}`,
+        '# HELP trace_gen_dry_run 1 if the last run was --dry-run.',
+        '# TYPE trace_gen_dry_run gauge',
+        `trace_gen_dry_run${labels} ${stats.dryRun ? 1 : 0}`,
+        '# HELP trace_gen_last_run_timestamp Unix time of the last completed gen pass.',
+        '# TYPE trace_gen_last_run_timestamp gauge',
+        `trace_gen_last_run_timestamp${labels} ${stats.lastRunTs}`,
+        '',
+    ].join('\n');
+}
+
+/**
+ * @param {string} promFile
+ * @param {object} stats
+ * @param {{ chain?: string, onError?: (msg: string) => void }} [opts]
+ */
+export function writeMetrics(promFile, stats, opts = {}) {
+    writePromSection(promFile, formatMetrics(stats, opts.chain || 'mainnet'), 'trace_gen_', opts);
+}
+
+/**
  * Entry point. `env`, `argv`, `io`, and injectable dependencies are exposed
  * so the whole flow is testable without touching the real DeepSeek API.
  *
@@ -560,10 +616,12 @@ export async function main(env = process.env, argv = process.argv.slice(2), io =
                 + estimateTokens(job.userPrompt);
             if (cfg.limit !== undefined && planned >= cfg.limit) break;
         }
-        io.log(formatSummary({
+        const summary = {
             ok: 0, skipped, failed: 0, tokensIn, tokensOut: 0,
             cacheHit: 0, cacheMiss: 0, dryRun: true, planned,
-        }));
+        };
+        io.log(formatSummary(summary));
+        publishGenMetrics(env, io, summary);
         return;
     }
 
@@ -653,10 +711,17 @@ export async function main(env = process.env, argv = process.argv.slice(2), io =
         cacheMiss += entry.usage.prompt_cache_miss_tokens;
     });
 
-    io.log(formatSummary({
-        ok, skipped, failed, tokensIn, tokensOut, cacheHit, cacheMiss,
-    }));
+    const summary = { ok, skipped, failed, tokensIn, tokensOut, cacheHit, cacheMiss };
+    io.log(formatSummary(summary));
+    publishGenMetrics(env, io, summary);
     if (failed > 0) process.exitCode = 1;
+}
+
+function publishGenMetrics(env, io, summary) {
+    writeMetrics(env.PROM_FILE || '', { ...summary, lastRunTs: Math.floor(Date.now() / 1000) }, {
+        chain: env.CHAIN || 'mainnet',
+        onError: (msg) => io.error(msg),
+    });
 }
 
 function numOr0(v) {

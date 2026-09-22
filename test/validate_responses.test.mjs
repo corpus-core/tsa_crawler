@@ -24,6 +24,7 @@ import {
     writeValidationEntry,
     pickWorst,
     formatSummary,
+    formatMetrics,
     main,
     HELP,
     JUDGE_SYSTEM_PROMPT,
@@ -409,6 +410,26 @@ describe('summary helpers', () => {
         assert.match(live, /judge scores:\s+1=0 2=0 3=0 4=1 5=0 unparseable=0/);
         assert.match(live, /judge tokens:\s+in=10 out=2/);
     });
+
+    it('formatMetrics emits verdict and judge-score series', () => {
+        const body = formatMetrics({
+            pairs: 2623, processed: 2623, skipped: 0, detRecomputed: 2623,
+            verdicts: { pass: 2189, warn: 262, fail: 172 },
+            ratioSum: 2479.5, ratioCount: 2623,
+            judgePlanned: 141, judgeOk: 141, judgeFailed: 0,
+            judgeHist: { 3: 6, 4: 28, 5: 107 },
+            judgeTokensIn: 988014, judgeTokensOut: 294237,
+            lastRunTs: 1700000000,
+        }, 'mainnet');
+        assert.match(body, /trace_validate_verdict\{chain="mainnet",verdict="pass"\} 2189/);
+        assert.match(body, /trace_validate_verdict\{chain="mainnet",verdict="fail"\} 172/);
+        assert.match(body, /trace_validate_judge_score\{chain="mainnet",score="5"\} 107/);
+        assert.match(body, /trace_validate_judge_score\{chain="mainnet",score="1"\} 0/);
+        assert.match(body, /trace_validate_judge_score\{chain="mainnet",score="unparseable"\} 0/);
+        assert.match(body, /trace_validate_judge_prompt_tokens\{chain="mainnet"\} 988014/);
+        assert.match(body, /trace_validate_mean_ratio\{chain="mainnet"\} 0\.945292/);
+        assert.equal(body.endsWith('\n'), true);
+    });
 });
 
 describe('main', () => {
@@ -443,9 +464,14 @@ describe('main', () => {
         writeResponse(p, 'simple', 'Claimed #41, 1,000 tokens, 999 unknown.');
         const cap = capture(); prevExit = cap.prev;
         let fetches = 0;
-        await main({ DATA_DIR: root, JUDGE_SAMPLE_PCT: '100' }, ['--dry-run'], cap.io, { fetch: async () => { fetches++; } });
+        const prom = path.join(root, 'val.prom');
+        await main({ DATA_DIR: root, JUDGE_SAMPLE_PCT: '100', PROM_FILE: prom }, ['--dry-run'], cap.io, { fetch: async () => { fetches++; } });
         assert.equal(process.exitCode, undefined);
         assert.equal(fetches, 0);
+        const promBody = fs.readFileSync(prom, 'utf8');
+        assert.match(promBody, /trace_validate_verdict\{chain="mainnet",verdict="fail"\} 1/);
+        assert.match(promBody, /trace_validate_judge_planned\{chain="mainnet"\} 1/);
+        assert.match(promBody, /trace_validate_dry_run\{chain="mainnet"\} 1/);
         assert.equal(fs.existsSync(validationPathForPrompt(p)), false);
         const out = cap.logs.join('\n');
         assert.match(out, /pairs:\s+1/);

@@ -1,6 +1,6 @@
 # Agent notes
 
-This repo builds **training prompts** for an SLM that explains Ethereum transactions. It is a small Node toolchain, not an app: collector → prepare → query → dedup.
+This repo builds **training prompts and teacher responses** for an SLM that explains Ethereum transactions. It is a small Node toolchain, not an app: collector → prepare → query → dedup → gen-responses → export-dataset.
 
 Read `README.md` for the human-facing pipeline and env vars. This file is for changing the code without breaking layout, CAP accounting, or the explainer contract.
 
@@ -14,6 +14,8 @@ All runnable code lives in `src/`. Tests stay in `test/` and import from `../src
 | `src/prepare-testdata.mjs` | Trace → `_sim.json` → `_prompt.json`. Talks to RPC + Sourcify via the explainer. |
 | `src/query.mjs` | Read-only prompt filter. CLI is `parseArgs` / `main`; keep helpers exported for tests. |
 | `src/dedup.mjs` | Cluster prompts by (path method_id × interface hash); copy CAP keep-set to `OUT`. DATA_DIR is read-only. |
+| `src/gen_responses.mjs` | Call DeepSeek Chat Completions with the student prompt; write sibling `_response.json`. `fetch` is injectable for tests. |
+| `src/export_dataset.mjs` | Pair `_prompt.json` + `_response.json`, emit `train.jsonl` / `val.jsonl` / `manifest.json` with a codehash-cohesive split. |
 | `src/bucket_paths.mjs` | **Single source of truth** for on-disk layout. |
 | `src/proxy_accesslist.mjs` | Access list + proxy implementation resolution. |
 | `src/sim-from-trace.mjs` | Collector file → Colibri simulation JSON. |
@@ -33,7 +35,7 @@ Canonical path:
 ```
 
 - Codehash and selector directories have **no `0x`**. Empty calldata selector is the directory `fallback`.
-- Collector traces match `^0x[0-9a-f]{64}\.json$`. `_sim.json`, `_prompt.json`, `_prompt.nosrc` are siblings, not traces. `listTraceFiles` must ignore them.
+- Collector traces match `^0x[0-9a-f]{64}\.json$`. `_sim.json`, `_prompt.json`, `_prompt.nosrc`, and `_response.json` are siblings, not traces. `listTraceFiles` must ignore them.
 - In-memory bucket id is `<64-hex-codehash>_<selector>` (`bucketKey`). CAP counting and query `-c`/`-m` depend on that.
 - Writes are atomic: `file.tmp` then `rename`. Never leave a half-written JSON as the final name.
 - `traces/`, `test_data/`, `train_data/`, and `sol_cache/` are gitignored. Do not commit them.
@@ -86,6 +88,23 @@ The explainer lives **outside** this repo (`EXPLAINER_DIR`). Docker sets `SKIP_E
 - Keep-set copy: `_prompt.json` plus sibling `_sim.json` when present. Do not copy collector traces. Missing sims are skipped.
 - Prometheus: own `PROM_FILE` per process **and** chain. Write after every completed run (including `--dry-run`); skip help / early validation errors. Atomic `*.tmp` + rename.
 
+## Teacher-response invariants (`src/gen_responses.mjs`)
+
+- **Grounding**: the teacher sees exactly the student prompt (same `systemPrompt` + `userPrompt`). `TEACHER_SYSTEM_SUFFIX` is the only allowed extension; it is stored implicitly via `promptSha256` so the exporter can detect drift.
+- Response siblings live next to the trace/prompt files as `<txhash>_response.json`. `listTraceFiles` must ignore them (same rule as `_sim.json` / `_prompt.json`).
+- Never store a failed call. `finish_reason != "stop"`, empty `content`, HTTP 4xx (except 429), and hard failures after `MAX_RETRIES` are logged and skipped, not written.
+- Merge on write: preserve entries for other styles when adding a new one. The per-entry `model` field is authoritative for the exporter; the top-level `model` is informational.
+- Retry only 429, 5xx, and network/timeout errors, with full-jitter exponential backoff bounded at 30s. `AbortController` enforces `TIMEOUT_MS` per attempt.
+- `fetch`, `sleep`, `rng`, and `now` are injectable through `main`'s `deps` argument. All tests use mocks; no live DeepSeek call is ever made from `node:test`.
+- Atomic writes: `.tmp` + `rename` in `writeResponseEntry`.
+
+## Export invariants (`src/export_dataset.mjs`)
+
+- One JSONL row per (prompt file × style): `messages = [system, user, assistant]` where `assistant.content` is exactly `entry.content`. **Never** put `reasoning_content` in the assistant message.
+- Skip when `entry.promptSha256` does not match the current prompt hash, when `entry.finishReason != "stop"`, or when `content` is empty. All skips are counted by reason in the manifest.
+- Split is deterministic: `sha256(SEED || codehash)` bucketed against `VAL_RATIO`. Every tx under the same codehash lands in the same split — do not weaken this or the val loss will underestimate generalisation.
+- `DATA_DIR` is read-only. The exporter writes only under `OUT` (`train.jsonl`, `val.jsonl`, `manifest.json`) with atomic writes.
+
 ## Coding rules
 
 - Comments and public docs in **English**. JSDoc on exported functions: markdown in the description, only `@param` and `@return` as tags.
@@ -104,6 +123,6 @@ That is `node --test test/*.test.mjs`. Run it after layout, query, sim, step-2a/
 
 ## Out of scope unless asked
 
-- Fine-tuning / training loop (this repo only **produces** prompts).
+- Fine-tuning / training loop (this repo only **produces** prompts and teacher responses).
 - Changing compose host paths, Loki URLs, or production volume owners.
 - Force-push, amending others' commits, or committing `test_data/` / secrets.

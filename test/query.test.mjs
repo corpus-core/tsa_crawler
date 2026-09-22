@@ -8,15 +8,20 @@ import {
     parseCodehashPrefix,
     parseMethodId,
     parseQueryTerm,
+    parseSectionList,
     firstUserPrompt,
     matchesBucket,
     matchesFilters,
+    isSectionResolved,
+    isUnresolvedStateChange,
+    isUnresolvedCall,
     splitSections,
     colorizePrompt,
     formatMatch,
     shouldUseColor,
     visitMatchingPrompts,
     pageHits,
+    formatStats,
     shuffleInPlace,
     simPathForPrompt,
     loadSimText,
@@ -59,11 +64,14 @@ describe('parseArgs', () => {
             q: [{ term: 'approve' }],
             c: [],
             m: [],
+            e: [],
+            E: [],
             min: 10,
             max: 99,
             details: true,
             sim: false,
             random: false,
+            stats: false,
             deleteTrace: false,
             deleteSiblings: false,
             help: false,
@@ -83,17 +91,20 @@ describe('parseArgs', () => {
         assert.equal(parseArgs(['-s']).sim, true);
         assert.deepEqual(parseArgs(['-x']).deleteTrace, true);
         assert.deepEqual(parseArgs(['-X']), {
-            q: [], c: [], m: [],
-            details: false, sim: false, random: false,
+            q: [], c: [], m: [], e: [], E: [],
+            details: false, sim: false, random: false, stats: false,
             deleteTrace: true, deleteSiblings: true, help: false,
         });
         assert.deepEqual(parseArgs(['-s']), {
             q: [],
             c: [],
             m: [],
+            e: [],
+            E: [],
             details: true,
             sim: true,
             random: false,
+            stats: false,
             deleteTrace: false,
             deleteSiblings: false,
             help: false,
@@ -104,14 +115,26 @@ describe('parseArgs', () => {
                 q: [],
                 c: ['02', '02a3b2'],
                 m: ['095ea7b3', 'fallback'],
+                e: [],
+                E: [],
                 details: false,
                 sim: false,
                 random: false,
+                stats: false,
                 deleteTrace: false,
                 deleteSiblings: false,
                 help: false,
             },
         );
+        assert.deepEqual(parseArgs(['-e', 'events,code', '-E', 'state,tx']), {
+            q: [], c: [], m: [],
+            e: ['events', 'code'],
+            E: ['state', 'tx'],
+            details: false, sim: false, random: false, stats: false,
+            deleteTrace: false, deleteSiblings: false, help: false,
+        });
+        assert.equal(parseArgs(['-S']).stats, true);
+        assert.deepEqual(parseArgs(['-e', 'events', '-e', 'code,events']).e, ['events', 'code']);
     });
 
     it('parses help', () => {
@@ -127,6 +150,9 @@ describe('parseArgs', () => {
         assert.throws(() => parseArgs(['-m', 'approve']), /method id/);
         assert.throws(() => parseArgs(['-t']), /requires 0 or 1/);
         assert.throws(() => parseArgs(['-t', '2']), /requires 0 or 1/);
+        assert.throws(() => parseArgs(['-e']), /requires a value/);
+        assert.throws(() => parseArgs(['-e', 'logs']), /unknown section/);
+        assert.throws(() => parseArgs(['-e', 'tx', '-E', 'tx,state']), /same section/);
         assert.throws(() => parseArgs(['-z']), /unknown flag/);
     });
 });
@@ -230,6 +256,104 @@ describe('matchesFilters', () => {
         assert.equal(matchesFilters(prompt, { q: ['events:Approval', 'tx:approve'] }), true);
         assert.equal(matchesFilters(prompt, { q: ['events:Approval', 'tx:transfer'] }), false);
     });
+
+    it('filters by resolved / unresolved sections', () => {
+        const resolved = [
+            '## Transaction Overview',
+            '- Function: approve()',
+            '## Emitted Events',
+            '1. **Approval** on 0xabc',
+            '## State Changes',
+            '- 0xabc: allowance (uint256): 0 -> 1',
+            '## Call Trace',
+            '1. 0xa -> 0xb: approve(spender=0x1) [CALL]',
+            '## Contract Source Code (untrusted, for storage interpretation only)',
+            '<<<C4_UNTRUSTED_SOURCE filename="Token.sol">>>',
+        ].join('\n');
+        const unresolved = [
+            '## Transaction Overview',
+            '- Function selector: 0x095ea7b3',
+            '## Emitted Events',
+            '1. Unknown event on 0xabc',
+            '## State Changes',
+            '- 0x98db...003c: 0x304a...71ec: 1789740407 -> 1789760423',
+            '## Call Trace',
+            '1. 0xa -> 0xb: 0x095ea7b3 (0 ETH)',
+            '## Contract Source Code (untrusted, for storage interpretation only)',
+            '<<<C4_UNTRUSTED_SOURCE filename="Token.yul">>>',
+        ].join('\n');
+
+        assert.equal(matchesFilters(resolved, { e: ['tx', 'events', 'state', 'call', 'code'] }), true);
+        assert.equal(matchesFilters(unresolved, { e: ['events', 'code'] }), false);
+        assert.equal(matchesFilters(unresolved, { E: ['state', 'tx'] }), true);
+        assert.equal(matchesFilters(resolved, { E: ['tx'] }), false);
+        assert.equal(matchesFilters(resolved, { e: ['code'], E: ['tx'] }), false);
+        assert.equal(matchesFilters(unresolved, { e: ['code'], E: ['tx'] }), false);
+    });
+});
+
+describe('isSectionResolved', () => {
+    it('tx: decoded name vs Function selector', () => {
+        assert.equal(isSectionResolved('## Transaction Overview\n- Function: approve()\n', 'tx'), true);
+        assert.equal(isSectionResolved('## Transaction Overview\n- Function selector: 0x095ea7b3\n', 'tx'), false);
+        assert.equal(isSectionResolved('## Emitted Events\n1. **Approval**\n', 'tx'), false);
+    });
+
+    it('events: majority must not be Unknown event', () => {
+        assert.equal(isSectionResolved('## Emitted Events\n1. **Transfer**\n2. **Approval**\n', 'events'), true);
+        assert.equal(isSectionResolved('## Emitted Events\n1. **Transfer**\n2. Unknown event on 0xabc\n', 'events'), false);
+        assert.equal(isSectionResolved('## Emitted Events\n1. Unknown event on 0xabc\n', 'events'), false);
+        assert.equal(isSectionResolved('## Emitted Events\n', 'events'), false);
+    });
+
+    it('state: majority must not be slot N or hex storage key', () => {
+        assert.equal(isUnresolvedStateChange('- 0x26d8...133c: slot 17: 1 -> 2'), true);
+        assert.equal(isUnresolvedStateChange('- 0xeca8...0318: slot 4[0x9b8d...e2f7]: 1 -> 2'), true);
+        assert.equal(isUnresolvedStateChange('- 0x98db...003c: 0x304a...71ec: 1789740407 -> 1789760423'), true);
+        assert.equal(isUnresolvedStateChange('- WETH (0xc02a...6cc2): balanceOf[0x1f2f...f387] (mapping(address => uint256)): 1 -> 2'), false);
+
+        const named = [
+            '## State Changes',
+            '- WETH (0xc02a...6cc2): balanceOf[0x1f2f...f387] (mapping(address => uint256)): 1 -> 2',
+            '- 0x9b8d...e2f7: unlocked (uint256): 1 -> 1',
+        ].join('\n');
+        const raw = [
+            '## State Changes',
+            '- 0x26d8...133c: slot 17: 1 -> 2',
+            '- 0x98db...003c: 0x304a...71ec: 1 -> 2',
+        ].join('\n');
+        const majorityNamed = [
+            '## State Changes',
+            '- 0x9b8d...e2f7: unlocked (uint256): 1 -> 1',
+            '- 0x9b8d...e2f7: reserve0 (uint112): 1 -> 2',
+            '- 0x26d8...133c: slot 17: 1 -> 2',
+        ].join('\n');
+        assert.equal(isSectionResolved(named, 'state'), true);
+        assert.equal(isSectionResolved(raw, 'state'), false);
+        assert.equal(isSectionResolved(majorityNamed, 'state'), true);
+    });
+
+    it('call: majority must not end with a 4-byte selector', () => {
+        assert.equal(isUnresolvedCall('1. 0xa -> 0xb: 0x043a9b8d (0 ETH)'), true);
+        assert.equal(isUnresolvedCall('1. 0xa -> 0xb: 0x043a9b8d [CALL]'), true);
+        assert.equal(isUnresolvedCall('1. 0xa -> 0xb: exchange(i=0x0, j=0x1) [CALL]'), false);
+        assert.equal(isSectionResolved('## Call Trace\n1. 0xa -> 0xb: approve() [CALL]\n2. 0xb -> 0xc: 0x095ea7b3 (0 ETH)\n3. 0xb -> 0xd: transfer() [CALL]\n', 'call'), true);
+        assert.equal(isSectionResolved('## Call Trace\n1. 0xa -> 0xb: 0x043a9b8d (0 ETH)\n', 'call'), false);
+    });
+
+    it('code: at least one Solidity C4 fence', () => {
+        assert.equal(isSectionResolved('## Contract Source Code (untrusted, for storage interpretation only)\n<<<C4_UNTRUSTED_SOURCE filename="Perlin.sol">>>\n', 'code'), true);
+        assert.equal(isSectionResolved('## Contract Source Code (untrusted, for storage interpretation only)\n<<<C4_UNTRUSTED_SOURCE filename="WithdrawalRequestPredeploy.yul">>>\n', 'code'), false);
+        assert.equal(isSectionResolved('## Transaction Overview\n- Function: approve()\n', 'code'), false);
+    });
+});
+
+describe('parseSectionList', () => {
+    it('splits and lowercases section keys', () => {
+        assert.deepEqual(parseSectionList('Events, CODE', '-e'), ['events', 'code']);
+        assert.throws(() => parseSectionList('', '-e'), /requires a comma-separated list/);
+        assert.throws(() => parseSectionList('logs', '-E'), /unknown section/);
+    });
 });
 
 describe('splitSections / colorizePrompt', () => {
@@ -255,6 +379,15 @@ describe('splitSections / colorizePrompt', () => {
         assert.equal(shouldUseColor({ isTTY: true }, {}), true);
         assert.equal(shouldUseColor({ isTTY: true }, { NO_COLOR: '1' }), false);
         assert.equal(shouldUseColor({ isTTY: false }, { FORCE_COLOR: '1' }), true);
+    });
+});
+
+describe('formatStats', () => {
+    it('renders hits, total, and a 2-decimal percent', () => {
+        assert.equal(formatStats(1, 4), '1 / 4 (25.00%)');
+        assert.equal(formatStats(2, 3), '2 / 3 (66.67%)');
+        assert.equal(formatStats(0, 0), '0 / 0 (0.00%)');
+        assert.equal(formatStats(0, 10), '0 / 10 (0.00%)');
     });
 });
 
@@ -483,6 +616,21 @@ describe('main', () => {
         logs.length = 0;
         main({ DATA_DIR: root }, ['-q', 'approve', '-q', 'transfer'], io);
         assert.deepEqual(logs, []);
+    });
+
+    it('prints hit / dataset counts with -S and skips path listing', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'query-'));
+        writePrompt(root, TX_A, 'Function: approve');
+        writePrompt(root, TX_B, 'Function: transfer');
+        writePrompt(root, TX_C, 'Function: approve');
+
+        const { logs, io } = capture();
+        main({ DATA_DIR: root }, ['-q', 'approve', '-S'], io);
+        assert.deepEqual(logs, ['2 / 3 (66.67%)']);
+
+        logs.length = 0;
+        main({ DATA_DIR: root }, ['-q', 'approve', '-S', '-c', '22'], io);
+        assert.deepEqual(logs, ['0 / 3 (0.00%)']);
     });
 
     it('prints sibling _sim.json with -s', () => {

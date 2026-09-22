@@ -6,6 +6,11 @@
         "prepare-testdata": "node src/prepare-testdata.mjs",
         "dedup": "node src/dedup.mjs",
         "query": "node src/query.mjs",
+        "gen-responses": "node src/gen_responses.mjs",
+        "export-dataset": "node src/export_dataset.mjs",
         "test": "node --test test/*.test.mjs"
+    },
+    "dependencies": {
+        "@corpus-core/colibri-stateless": "^3.0.0"
     }
 }

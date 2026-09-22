@@ -31,6 +31,11 @@ Options:
   -s                  Like -d, plus the sibling <txhash>_sim.json (light blue)
   -t <0|1>            Keep txs whose collector {txhash}.json has (.trace.call)
                       (1) or does not (0)
+  -e <sections>       Keep files whose listed sections are resolved
+                      (comma-separated: tx,events,state,call,code)
+  -E <sections>       Keep files whose listed sections are not resolved
+  -S                  Print hit count, dataset count, and percentage
+                      (no path listing unless -d / -s / -x)
   -x                  Delete matching {txhash}.json files
   -X                  Like -x, plus _sim.json, _prompt.json, _prompt.nosrc,
                       _sim.nosrc; prune empty parent dirs
@@ -51,6 +56,17 @@ export const SECTION_HEADERS = [
 ];
 
 const SECTION_KEY_SET = new Set(SECTION_KEYS);
+
+/** Raw numbered slot (`: slot 5:` / `: slot 0[addr]:`). */
+export const STATE_SLOT_RE = /: slot [0-9]+/;
+/** Storage key is still a hex hash instead of a variable name. */
+export const STATE_HEX_KEY_RE = /^-\s+.+:\s+0x[0-9a-fA-F.]+:/;
+/** Call function is a 4-byte selector (after stripping `[CALL]` / `(value)`). */
+export const CALL_METHOD_ID_RE = /0x[0-9a-f]{8}\s*$/i;
+/** At least one Solidity file in a C4 source fence. */
+export const CODE_SOL_RE = /<<<C4_UNTRUSTED_SOURCE[^>\n]*\.sol"/i;
+export const TX_SELECTOR_MARK = 'Function selector: ';
+export const UNKNOWN_EVENT_MARK = 'Unknown event';
 
 /** Foreground colors for -d section output. */
 export const SECTION_COLOR = {
@@ -184,13 +200,29 @@ export function parseMethodId(val) {
 }
 
 /**
+ * @param {string} val
+ * @param {string} flag
+ * @return {string[]}
+ */
+export function parseSectionList(val, flag) {
+    const keys = String(val).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+    if (!keys.length) throw new Error(`${flag} requires a comma-separated list of sections`);
+    for (const key of keys) {
+        if (!SECTION_KEY_SET.has(key)) {
+            throw new Error(`${flag} unknown section: ${key} (tx,events,state,call,code)`);
+        }
+    }
+    return keys;
+}
+
+/**
  * @param {string[]} argv
- * @return {{ q: Array<{ term: string, section?: string }>, c: string[], m: string[], min?: number, max?: number, limit?: number, offset?: number, random: boolean, details: boolean, sim: boolean, hasCall?: boolean, deleteTrace: boolean, deleteSiblings: boolean, help: boolean }}
+ * @return {{ q: Array<{ term: string, section?: string }>, c: string[], m: string[], e: string[], E: string[], min?: number, max?: number, limit?: number, offset?: number, random: boolean, details: boolean, sim: boolean, stats: boolean, hasCall?: boolean, deleteTrace: boolean, deleteSiblings: boolean, help: boolean }}
  */
 export function parseArgs(argv) {
     const filters = {
-        q: [], c: [], m: [],
-        details: false, sim: false, random: false,
+        q: [], c: [], m: [], e: [], E: [],
+        details: false, sim: false, random: false, stats: false,
         deleteTrace: false, deleteSiblings: false, help: false,
     };
     for (let i = 0; i < argv.length; i++) {
@@ -212,6 +244,10 @@ export function parseArgs(argv) {
             filters.random = true;
             continue;
         }
+        if (a === '-S') {
+            filters.stats = true;
+            continue;
+        }
         if (a === '-x') {
             filters.deleteTrace = true;
             continue;
@@ -227,6 +263,15 @@ export function parseArgs(argv) {
                 throw new Error('-t requires 0 or 1');
             }
             filters.hasCall = val === '1';
+            continue;
+        }
+        if (a === '-e' || a === '-E') {
+            const val = argv[++i];
+            if (val === undefined || val.startsWith('-')) {
+                throw new Error(`${a} requires a value`);
+            }
+            const dest = a === '-e' ? filters.e : filters.E;
+            dest.push(...parseSectionList(val, a));
             continue;
         }
         if (a === '-q' || a === '-c' || a === '-m' || a === '-min' || a === '-max' || a === '-l' || a === '-o') {
@@ -258,7 +303,21 @@ export function parseArgs(argv) {
         }
         throw new Error(`unknown flag: ${a}`);
     }
+    filters.e = uniqueSections(filters.e);
+    filters.E = uniqueSections(filters.E);
+    const overlap = filters.e.filter((k) => filters.E.includes(k));
+    if (overlap.length) {
+        throw new Error(`cannot use the same section in -e and -E: ${overlap.join(',')}`);
+    }
     return filters;
+}
+
+/**
+ * @param {string[]} keys
+ * @return {string[]}
+ */
+function uniqueSections(keys) {
+    return [...new Set(keys)];
 }
 
 /**
@@ -288,7 +347,7 @@ export function matchesBucket(codehash, methodId, filters) {
 
 /**
  * @param {string} userPrompt
- * @param {{ q?: Array<string | { term: string, section?: string }>, min?: number, max?: number }} filters
+ * @param {{ q?: Array<string | { term: string, section?: string }>, min?: number, max?: number, e?: string[], E?: string[] }} filters
  * @return {boolean}
  */
 export function matchesFilters(userPrompt, filters) {
@@ -302,7 +361,88 @@ export function matchesFilters(userPrompt, filters) {
     }
     if (filters.min !== undefined && !(userPrompt.length > filters.min)) return false;
     if (filters.max !== undefined && !(userPrompt.length < filters.max)) return false;
+    for (const key of filters.e || []) {
+        if (!isSectionResolved(parts, key)) return false;
+    }
+    for (const key of filters.E || []) {
+        if (isSectionResolved(parts, key)) return false;
+    }
     return true;
+}
+
+/**
+ * @param {string} text
+ * @param {RegExp} re
+ * @return {string[]}
+ */
+function itemLines(text, re) {
+    return text.split('\n').filter((line) => re.test(line));
+}
+
+/**
+ * Strict majority: more than half of `items` must not be unresolved.
+ * An empty list is not resolved.
+ *
+ * @param {string[]} items
+ * @param {(line: string) => boolean} isUnresolved
+ * @return {boolean}
+ */
+function majorityResolved(items, isUnresolved) {
+    if (items.length === 0) return false;
+    let resolved = 0;
+    for (const line of items) {
+        if (!isUnresolved(line)) resolved++;
+    }
+    return resolved * 2 > items.length;
+}
+
+/**
+ * @param {string} line
+ * @return {boolean}
+ */
+export function isUnresolvedStateChange(line) {
+    return STATE_SLOT_RE.test(line) || STATE_HEX_KEY_RE.test(line);
+}
+
+/**
+ * @param {string} line
+ * @return {boolean}
+ */
+export function isUnresolvedCall(line) {
+    const stripped = line
+        .replace(/\s*\[(?:CALL|DELEGATECALL|STATICCALL|CREATE2?|CALLCODE)\]\s*$/i, '')
+        .replace(/\s*\([^)]*\)\s*$/, '');
+    return CALL_METHOD_ID_RE.test(stripped);
+}
+
+/**
+ * `tx` is resolved when the function name is decoded (no `Function selector: `).
+ * `events` / `state` / `call` need a strict majority of decoded items.
+ * `code` is resolved when at least one C4 fence is a `.sol` file.
+ *
+ * @param {string | Array<{ key: string | null, text: string }>} userPromptOrParts
+ * @param {string} key
+ * @return {boolean}
+ */
+export function isSectionResolved(userPromptOrParts, key) {
+    const parts = typeof userPromptOrParts === 'string'
+        ? splitSections(userPromptOrParts)
+        : userPromptOrParts;
+    const text = sectionText(parts, key);
+    switch (key) {
+        case 'tx':
+            return text.length > 0 && !text.includes(TX_SELECTOR_MARK);
+        case 'events':
+            return majorityResolved(itemLines(text, /^\d+\.\s/), (line) => line.includes(UNKNOWN_EVENT_MARK));
+        case 'state':
+            return majorityResolved(itemLines(text, /^-\s+\S/), isUnresolvedStateChange);
+        case 'call':
+            return majorityResolved(itemLines(text, /^\d+\.\s/), isUnresolvedCall);
+        case 'code':
+            return CODE_SOL_RE.test(text);
+        default:
+            return false;
+    }
 }
 
 /**
@@ -343,6 +483,8 @@ export function hasTraceCall(parsed) {
  */
 function needsUserPrompt(filters) {
     return (filters.q && filters.q.length > 0)
+        || (filters.e && filters.e.length > 0)
+        || (filters.E && filters.E.length > 0)
         || filters.min !== undefined
         || filters.max !== undefined
         || filters.details
@@ -504,6 +646,18 @@ export function shuffleInPlace(arr, rng = Math.random) {
  * @param {{ random?: boolean, offset?: number, limit?: number, rng?: () => number }} [opts]
  * @return {unknown[]}
  */
+/**
+ * `hits / total (pct%)`. `total === 0` is `0.00%`.
+ *
+ * @param {number} hits
+ * @param {number} total
+ * @return {string}
+ */
+export function formatStats(hits, total) {
+    const pct = total === 0 ? 0 : (hits * 100) / total;
+    return `${hits} / ${total} (${pct.toFixed(2)}%)`;
+}
+
 export function pageHits(hits, { random = false, offset = 0, limit, rng = Math.random } = {}) {
     const out = random ? shuffleInPlace(hits.slice(), rng) : hits;
     const start = offset || 0;
@@ -513,19 +667,34 @@ export function pageHits(hits, { random = false, offset = 0, limit, rng = Math.r
 }
 
 /**
+ * Walk every bucket. `scanned` is every prompt (or every tx when `-t` is set),
+ * including buckets that fail `-c` / `-m`. `matched` is the filter keep-set.
+ *
  * @param {string} root
  * @param {object} filters
  * @param {(hit: { relPath: string, absPath: string, userPrompt: string }) => void} onHit
  * @param {(msg: string) => void} [onWarn]
+ * @return {{ scanned: number, matched: number }}
  */
 function forEachMatching(root, filters, onHit, onWarn) {
     const wantCall = filters.hasCall;
     const requirePrompt = needsUserPrompt(filters) || wantCall === undefined;
+    let scanned = 0;
+    let matched = 0;
     walkBuckets(root, (dir, key) => {
         const bucket = key.match(BUCKET_KEY_RE);
-        if (!bucket || !matchesBucket(bucket[1], bucket[2], filters)) return;
+        if (!bucket) return;
+        const bucketOk = matchesBucket(bucket[1], bucket[2], filters);
         const byTx = indexBucketFiles(dir);
         for (const [, files] of byTx) {
+            if (wantCall === undefined) {
+                if (!files.prompt) continue;
+            } else if (!files.prompt && !files.trace) {
+                continue;
+            }
+            scanned++;
+            if (!bucketOk) continue;
+
             const promptAbs = files.prompt ? path.join(dir, files.prompt) : null;
             const traceAbs = files.trace
                 ? path.join(dir, files.trace)
@@ -542,8 +711,6 @@ function forEachMatching(root, filters, onHit, onWarn) {
                     }
                 }
                 if (hasTraceCall(parsed) !== wantCall) continue;
-            } else if (!files.prompt) {
-                continue;
             }
 
             let userPrompt = null;
@@ -565,6 +732,7 @@ function forEachMatching(root, filters, onHit, onWarn) {
             }
 
             const absPath = promptAbs || traceAbs;
+            matched++;
             onHit({
                 relPath: path.relative(root, absPath),
                 absPath,
@@ -573,6 +741,7 @@ function forEachMatching(root, filters, onHit, onWarn) {
             });
         }
     });
+    return { scanned, matched };
 }
 
 /**
@@ -583,26 +752,31 @@ function forEachMatching(root, filters, onHit, onWarn) {
  * @param {{ q?: Array<string | { term: string, section?: string }>, c?: string[], m?: string[], min?: number, max?: number, limit?: number, offset?: number, random?: boolean, rng?: () => number }} filters
  * @param {(hit: { relPath: string, absPath: string, userPrompt: string }) => void} onMatch
  * @param {(msg: string) => void} [onWarn]
+ * @return {{ scanned: number, matched: number }}
  */
 export function visitMatchingPrompts(root, filters, onMatch, onWarn) {
     const limit = filters.limit;
-    if (limit === 0) return;
     const offset = filters.offset || 0;
     const rng = filters.rng || Math.random;
+    const emitHits = !filters.stats || filters.details || filters.sim || filters.deleteTrace;
+    if (limit === 0 && !filters.stats) return { scanned: 0, matched: 0 };
 
-    if (filters.random) {
+    if (filters.random || filters.stats) {
         const hits = [];
-        forEachMatching(root, filters, (hit) => hits.push(hit), onWarn);
-        for (const hit of pageHits(hits, { random: true, offset, limit, rng })) {
-            onMatch(hit);
+        const onHit = emitHits ? (hit) => hits.push(hit) : () => { };
+        const counts = forEachMatching(root, filters, onHit, onWarn);
+        if (emitHits && limit !== 0) {
+            for (const hit of pageHits(hits, { random: !!filters.random, offset, limit, rng })) {
+                onMatch(hit);
+            }
         }
-        return;
+        return counts;
     }
 
     let skipped = 0;
     let emitted = 0;
     try {
-        forEachMatching(root, filters, (hit) => {
+        return forEachMatching(root, filters, (hit) => {
             if (skipped < offset) {
                 skipped++;
                 return;
@@ -613,6 +787,7 @@ export function visitMatchingPrompts(root, filters, onMatch, onWarn) {
         }, onWarn);
     } catch (e) {
         if (e !== STOP) throw e;
+        return { scanned: 0, matched: 0 };
     }
 }
 
@@ -652,15 +827,18 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
 
     const color = (filters.details || filters.sim) && shouldUseColor(process.stdout, env);
     const progressEvery = parseInt(env.PROGRESS_EVERY || '100', 10) || 100;
+    const emitHits = !filters.stats || filters.details || filters.sim || filters.deleteTrace;
     let deletedTxs = 0;
     let deletedFiles = 0;
     let deletedDirs = 0;
-    visitMatchingPrompts(
+    const counts = visitMatchingPrompts(
         dataDir,
         filters,
         ({ relPath, absPath, traceAbsPath, userPrompt }) => {
-            const simText = filters.sim ? loadSimText(absPath, (msg) => io.error(msg)) : null;
-            io.log(formatMatch(relPath, userPrompt, filters.details, color, simText));
+            if (emitHits) {
+                const simText = filters.sim ? loadSimText(absPath, (msg) => io.error(msg)) : null;
+                io.log(formatMatch(relPath, userPrompt, filters.details, color, simText));
+            }
             if (!filters.deleteTrace || !traceAbsPath) return;
             const removed = unlinkTxFiles(traceAbsPath, filters.deleteSiblings);
             deletedFiles += removed.length;
@@ -673,6 +851,9 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
         },
         (msg) => io.error(msg),
     );
+    if (filters.stats) {
+        io.log(formatStats(counts.matched, counts.scanned));
+    }
     if (filters.deleteTrace) {
         io.error(`delete: done ${deletedTxs} txs, ${deletedFiles} files, ${deletedDirs} dirs`);
     }

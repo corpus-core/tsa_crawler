@@ -8,6 +8,8 @@ The pipeline is:
 2. **Prepare** those traces into simulation JSON, then into two prompt styles (simple + detailed).
 3. **Query** the resulting prompts so you can inspect coverage and pick training examples.
 4. **Dedup** clusters similar contracts and copies a CAP-sized keep-set for training.
+5. **Teacher responses** are generated with `src/gen_responses.mjs` (DeepSeek API).
+6. **Export** the paired prompts + responses as SFT JSONL with `src/export_dataset.mjs`.
 
 ```
 Geth (eth + debug)
@@ -23,6 +25,10 @@ src/prepare-testdata.mjs  →  <txhash>_sim.json      (step 1: simulation shape)
         ▼
 src/query.mjs             →  filter / dump prompts
 src/dedup.mjs             →  CAP keep-set under OUT (same layout)
+        │
+        ▼
+src/gen_responses.mjs     →  <txhash>_response.json (teacher answers from DeepSeek)
+src/export_dataset.mjs    →  train.jsonl + val.jsonl + manifest.json (SFT dataset)
 ```
 
 Requires **Node 18+** (Docker images use Node 22). No npm dependencies in this repo; the collector uses Node builtins only. Prompt generation needs the Colibri explainer from [colibri-stateless](https://github.com/corpus-core/colibri-stateless).
@@ -42,6 +48,7 @@ Traces and derived files live under `OUT` / `IN` / `DATA_DIR` (defaults: `./trac
         0x<txhash>_sim.json
         0x<txhash>_prompt.json
         0x<txhash>_prompt.nosrc
+        0x<txhash>_response.json  # teacher answers (one entry per style)
   .state.json                   # collector cursor (last processed block)
 ```
 
@@ -169,6 +176,103 @@ DATA_DIR=./test_data npm run dedup -- --out ./train_data --keep 1
 | `-h` | | Help |
 
 `OUT` must not be `DATA_DIR` (or a parent of it). A subdirectory such as `DATA_DIR/train` is fine: `walkBuckets` ignores names that are not a 2-hex prefix. Each run overwrites previous keep-set `_prompt.json` and sibling `_sim.json` files under `OUT` and writes `OUT/.dedup-manifest.json`.
+
+---
+
+## 5. Teacher responses — `src/gen_responses.mjs`
+
+Sends every `_prompt.json` first-entry (`style: "simple"` by default) to the DeepSeek Chat Completions API and stores the answer as a sibling `<txhash>_response.json`. The teacher receives **exactly the student prompt** (same system + user message) so the SLM learns to answer with the same context it will see in the browser at inference time. Failed calls, empty content, and any `finish_reason != "stop"` are never written; a re-run simply retries them.
+
+The response file merges multiple styles safely, so a later `STYLES=detailed` run does not overwrite existing `simple` answers.
+
+```bash
+DATA_DIR=./dedup node src/gen_responses.mjs --dry-run
+DATA_DIR=./dedup DEEPSEEK_API_KEY=sk-... LIMIT=5 node src/gen_responses.mjs
+DATA_DIR=./dedup DEEPSEEK_API_KEY=sk-... npm run gen-responses -- --limit 5
+```
+
+| Env / flag | Default | Meaning |
+| --- | --- | --- |
+| `DATA_DIR` | *(required)* | Prompt tree root |
+| `DEEPSEEK_API_KEY` | *(required unless `--dry-run`)* | DeepSeek key |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | Endpoint (OpenAI-compatible) |
+| `MODEL` | `deepseek-v4-pro` | Teacher model |
+| `STYLES` | `simple` | Comma list; each style becomes one API call per tx |
+| `THINKING` | `enabled` | `enabled` or `disabled` |
+| `REASONING_EFFORT` | `high` | `low` / `high` / `max` (ignored when thinking disabled) |
+| `MAX_TOKENS` | `16384` | Response cap incl. reasoning tokens |
+| `CONCURRENCY` | `4` | Parallel API calls |
+| `MAX_RETRIES` | `5` | Exponential backoff on `429`/`5xx`/network/timeout |
+| `TIMEOUT_MS` | `600000` | Per-request timeout |
+| `TEACHER_SYSTEM_SUFFIX` | *(empty)* | Appended to the student system prompt |
+| `KEEP_REASONING` | `1` | Store `reasoning_content` for later CoT distillation |
+| `FORCE` | *(off)* | Regenerate even when the sibling already matches the prompt hash |
+| `LIMIT` / `--limit <n>` | *(off)* | Cap issued API calls (useful for smoke tests) |
+| `PROGRESS_EVERY` | `25` | Log processed-count every N prompts (`0` = off) |
+| `--dry-run` | | Count prompts + estimate input tokens; no API calls |
+| `-h` | | Help |
+
+Each `_response.json` is:
+
+```json
+{
+  "version": 1,
+  "txHash": "0x…",
+  "codehash": "…",
+  "methodId": "…",
+  "model": "deepseek-v4-pro",
+  "responses": {
+    "simple": {
+      "model": "deepseek-v4-pro",
+      "content": "…",
+      "reasoningContent": "…",
+      "finishReason": "stop",
+      "usage": { "prompt_tokens": 0, "completion_tokens": 0, "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0, "reasoning_tokens": 0 },
+      "promptSha256": "…",
+      "requestId": "…",
+      "createdAt": "…",
+      "durationMs": 0
+    }
+  }
+}
+```
+
+Cost note: thinking mode charges its reasoning stream as output tokens; use `THINKING=disabled` on Flash for cheap smoke tests. Peak vs off-peak rates apply, see the DeepSeek pricing page.
+
+---
+
+## 6. Export dataset — `src/export_dataset.mjs`
+
+Pairs every `_prompt.json` with its sibling `_response.json` and emits one JSONL row per (tx × style) in the standard OpenAI chat-messages shape. TRL `SFTTrainer`, Unsloth, and Axolotl consume it directly.
+
+The train/val split is **deterministic and codehash-cohesive**: every tx sharing a codehash goes into the same split, so validation never leaks contract-specific idioms from training. Rows whose `promptSha256` no longer matches the current prompt (e.g. the prompt was regenerated with a different source budget), whose `finishReason != "stop"`, or with empty content are skipped and counted by reason.
+
+```bash
+DATA_DIR=./dedup node src/export_dataset.mjs --dry-run
+DATA_DIR=./dedup OUT=./train_data/sft node src/export_dataset.mjs
+DATA_DIR=./dedup npm run export-dataset -- --out ./train_data/sft
+```
+
+| Env / flag | Default | Meaning |
+| --- | --- | --- |
+| `DATA_DIR` | *(required)* | Prompt tree root |
+| `OUT` / `--out` | *(required unless `--dry-run`)* | Output directory |
+| `STYLES` | `simple` | Comma list of styles to export |
+| `VAL_RATIO` | `0.05` | Fraction of codehashes for `val.jsonl` (0 disables val) |
+| `SEED` | `1` | Salt for the codehash split hash |
+| `TEACHER_SYSTEM_SUFFIX` | *(empty)* | Must match the value used at generation time |
+| `PROGRESS_EVERY` | `500` | Log `export: scanned N ...` every N prompt files (`0` = off) |
+| `--dry-run` | | Stats only; no files written |
+| `-h` | | Help |
+
+Each JSONL row:
+
+```json
+{"messages":[{"role":"system","content":"…"},{"role":"user","content":"…"},{"role":"assistant","content":"…"}],
+ "meta":{"tx":"0x…","codehash":"…","method_id":"…","style":"simple","model":"deepseek-v4-pro","prompt_tokens":0,"completion_tokens":0,"rel_path":"…"}}
+```
+
+The run also writes `manifest.json` with counts, per-reason skip totals, token sums, distinct codehashes per split, and character-length percentiles for user + assistant messages.
 
 ---
 

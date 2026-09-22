@@ -19,7 +19,7 @@ All runnable code lives in `src/`. Tests stay in `test/` and import from `../src
 | `src/bucket_paths.mjs` | **Single source of truth** for on-disk layout. |
 | `src/proxy_accesslist.mjs` | Access list + proxy implementation resolution. |
 | `src/sim-from-trace.mjs` | Collector file → Colibri simulation JSON. |
-| `Dockerfile.traces` / `Dockerfile.prepare` / `Dockerfile.dedup` | COPY the needed `src/*.mjs` files into `/app` (flattened). Collector and dedup are alpine+node only. Prepare sparse-checkouts the explainer. Dedup copies `dedup.mjs`, `query.mjs`, `bucket_paths.mjs`. |
+| `Dockerfile.traces` / `Dockerfile.prepare` / `Dockerfile.dedup` / `Dockerfile.gen_responses` | COPY the needed `src/*.mjs` files into `/app` (flattened). Collector, dedup, and gen-responses are alpine+node only. Prepare sparse-checkouts the explainer. Dedup copies `dedup.mjs`, `query.mjs`, `bucket_paths.mjs`. Gen-responses copies `gen_responses.mjs`, `query.mjs`, `bucket_paths.mjs`. |
 | `test/*.test.mjs` | `node:test`. No network. Use temp dirs. |
 
 Everything is ESM (`.mjs`). Docker images do not use `package.json` `"type": "module"`; the `.mjs` suffix is enough.

@@ -285,12 +285,16 @@ The run also writes `manifest.json` with counts, per-reason skip totals, token s
 | `collector` | `Dockerfile.traces` | `src/fetch_traces.mjs`, host network so it can reach local Geth |
 | `prepare` | `Dockerfile.prepare` | `src/prepare-testdata.mjs` plus a built explainer; outbound HTTPS for Sourcify |
 | `dedup` | `Dockerfile.dedup` | One-shot `src/dedup.mjs`; profile `dedup`, does not start with `up` |
+| `gen-responses` | `Dockerfile.gen_responses` | One-shot `src/gen_responses.mjs`; profile `gen-responses`, does not start with `up`. Reads the deduped keep-set at `/data/traces/train` and writes sibling `_response.json` files via the DeepSeek API |
 
 ```bash
 docker compose --profile dedup run --rm dedup
+DEEPSEEK_API_KEY=sk-... docker compose --profile gen-responses run --rm gen-responses
+# Or put DEEPSEEK_API_KEY into an `.env` next to docker-compose.yml and just:
+docker compose --profile gen-responses run --rm gen-responses
 ```
 
-Dedup writes to `OUT=/data/traces/train` on the same volume. Collector, prepare, and dedup must **not** share a `PROM_FILE`. Compose host paths and Loki labels are environment-specific — edit them before `docker compose up`.
+Dedup writes to `OUT=/data/traces/train` on the same volume; `gen-responses` reads from that path and drops `_response.json` beside every `_prompt.json`. Collector, prepare, and dedup must **not** share a `PROM_FILE` (`gen-responses` does not write metrics yet). Compose host paths and Loki labels are environment-specific — edit them before `docker compose up`. `DEEPSEEK_API_KEY` is required for the `gen-responses` profile; compose fails loudly if it is unset.
 
 ---
 

@@ -132,3 +132,62 @@ services:
       - /srv/node_exporter/textfile:/metrics
 
     mem_limit: 1g
+
+  # One-shot teacher-response generation. Sends every _prompt.json first-entry
+  # to the DeepSeek Chat Completions API and writes a sibling _response.json
+  # in the same layout. Idempotent (skips fresh entries via promptSha256).
+  # Runs on the deduped keep-set (dedup writes to /data/traces/train).
+  # Does not start with `up`:
+  #   DEEPSEEK_API_KEY=sk-... docker compose --profile gen-responses run --rm gen-responses
+  # or with the key in a `.env` next to this file:
+  #   docker compose --profile gen-responses run --rm gen-responses
+  gen-responses:
+    build:
+      context: .
+      dockerfile: Dockerfile.gen_responses
+    image: colibri/trace-gen-responses:latest
+    container_name: trace-gen-responses
+    profiles: [ "gen-responses" ]
+    restart: "no"
+
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://193.26.158.2:3100/loki/api/v1/push"
+        loki-batch-size: "400"
+        loki-external-labels: "chain=mainnet,type=trace-gen-responses"
+
+    environment:
+      # Feeds on the deduped keep-set. Change to /data/traces to process the
+      # full prompt tree instead of the dedup output.
+      DATA_DIR: "/data/traces/train"
+      # Required. Compose reads it from the .env at the repo root (or from the
+      # calling shell); the ":?" makes compose fail loudly if it is missing.
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?DEEPSEEK_API_KEY is required (set it in .env or export it)}
+      DEEPSEEK_BASE_URL: "https://api.deepseek.com"
+      MODEL: "deepseek-v4-pro"
+      # Comma list of prompt styles to answer (simple, detailed, ...).
+      STYLES: "simple"
+      THINKING: "enabled"
+      REASONING_EFFORT: "high"
+      MAX_TOKENS: "16384"
+      CONCURRENCY: "4"
+      MAX_RETRIES: "5"
+      TIMEOUT_MS: "600000"
+      KEEP_REASONING: "1"
+      PROGRESS_EVERY: "25"
+      # Optional smoke-run cap (e.g. LIMIT=5); empty = full pass.
+      LIMIT: ""
+      # Optional: FORCE=1 regenerates existing entries; empty = keep cache.
+      FORCE: ""
+      # Optional teacher-only guidance appended to the student system prompt.
+      # If set, must match at export time (SHA256 gate).
+      TEACHER_SYSTEM_SUFFIX: ""
+      # Metric label — this script doesn't write Prometheus metrics yet, but
+      # the label is here for parity with the other services.
+      CHAIN: "mainnet"
+
+    volumes:
+      - /srv/trace-data:/data/traces
+
+    mem_limit: 1g

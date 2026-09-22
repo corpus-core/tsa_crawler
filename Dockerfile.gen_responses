@@ -1,0 +1,28 @@
+FROM node:22-alpine
+
+# gen_responses uses Node builtins only (fs, path, crypto, url, global fetch).
+# No npm install, no explainer. The container needs outbound HTTPS to reach
+# the DeepSeek Chat Completions API.
+WORKDIR /app
+COPY src/gen_responses.mjs src/query.mjs src/bucket_paths.mjs ./
+
+# Non-root (uid 1000). The mounted volume must be owned by uid 1000
+# (same as collector/prepare/dedup).
+USER node
+
+# Safe defaults; secrets (DEEPSEEK_API_KEY) come from compose environment.
+ENV DATA_DIR=/data/traces/train \
+    DEEPSEEK_BASE_URL=https://api.deepseek.com \
+    MODEL=deepseek-v4-pro \
+    STYLES=simple \
+    THINKING=enabled \
+    REASONING_EFFORT=high \
+    MAX_TOKENS=16384 \
+    CONCURRENCY=4 \
+    MAX_RETRIES=5 \
+    TIMEOUT_MS=600000 \
+    KEEP_REASONING=1 \
+    PROGRESS_EVERY=25 \
+    CHAIN=mainnet
+
+CMD ["node", "gen_responses.mjs"]

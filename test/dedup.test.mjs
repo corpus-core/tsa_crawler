@@ -7,6 +7,7 @@ import {
     parseArgs,
     resolveCap,
     resolveProgressEvery,
+    resolveRequireResolved,
     DEFAULT_CAP,
     DEFAULT_PROGRESS_EVERY,
     HELP,
@@ -292,6 +293,24 @@ describe('selectByCap / compareKeep', () => {
         ], 1);
         assert.deepEqual(kept.map((x) => x.relPath), ['aa.json']);
         assert.deepEqual(dropped.map((x) => x.relPath), ['zz.json']);
+        assert.equal(kept[0].pinned, false);
+    });
+
+    it('pinned keepers take slots before a higher score, still within cap', () => {
+        const low = { relPath: 'low.json', cluster: 'c', score: 1 };
+        const mid = { relPath: 'mid.json', cluster: 'c', score: 5 };
+        const high = { relPath: 'high.json', cluster: 'c', score: 9 };
+        const pinned = new Set(['low.json', 'mid.json']);
+        const { kept, dropped } = selectByCap([high, low, mid], 2, { pinned });
+        assert.deepEqual(kept.map((x) => x.relPath), ['low.json', 'mid.json']);
+        assert.deepEqual(kept.map((x) => x.pinned), [true, true]);
+        assert.deepEqual(dropped.map((x) => x.relPath), ['high.json']);
+        assert.equal(dropped[0].pinned, false);
+        // Cap still applies among the pinned themselves (score order).
+        const tight = selectByCap([high, low, mid], 1, { pinned });
+        assert.deepEqual(tight.kept.map((x) => x.relPath), ['mid.json']);
+        // Without the set, score wins as before.
+        assert.deepEqual(selectByCap([high, low, mid], 1).kept.map((x) => x.relPath), ['high.json']);
     });
 });
 
@@ -452,6 +471,51 @@ describe('main', () => {
         assert.equal(manifest.kept.length, 1);
         assert.equal(manifest.kept[0].relPath, relA);
         assert.equal(manifest.kept[0].txFunction, 'transfer');
+        assert.equal(manifest.kept[0].pinned, false);
+    });
+
+    it('REQUIRE_RESOLVED skips candidates whose section is not decoded', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'dedup-'));
+        const decoded = writePrompt(root, TX_A, wrapSource(ERC20_BASE), { hash: HASH_A });
+        const selector = wrapSource(ERC20_BASE).replace(
+            '- Function: transfer(to=0x1, amount=1)',
+            '- Function selector: 0xa9059cbb',
+        );
+        writePrompt(root, TX_B, selector, { hash: HASH_B });
+        const open = collectCandidates(root);
+        assert.equal(open.candidates.length, 2);
+        assert.equal(open.skippedUnresolved, 0);
+        const filtered = collectCandidates(root, { requireResolved: ['tx'] });
+        assert.equal(filtered.skippedUnresolved, 1);
+        assert.deepEqual(filtered.candidates.map((c) => c.relPath), [decoded]);
+        assert.throws(() => resolveRequireResolved({ REQUIRE_RESOLVED: 'nope' }), /unknown section/);
+        assert.deepEqual(resolveRequireResolved({}), []);
+        assert.deepEqual(resolveRequireResolved({ REQUIRE_RESOLVED: '' }), []);
+        assert.deepEqual(resolveRequireResolved({ REQUIRE_RESOLVED: 'tx,events' }), ['tx', 'events']);
+    });
+
+    it('STICKY keeps the answered tx even when a richer one arrives', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'dedup-'));
+        const low = writePrompt(root, TX_A, scoredPrompt({ gas: '1' }), { hash: HASH_A });
+        writePrompt(root, TX_B, scoredPrompt({ gas: '200,000', eventCount: 3 }), { hash: HASH_B });
+        const out = path.join(root, 'train');
+        const answered = path.join(out, low);
+        fs.mkdirSync(path.dirname(answered), { recursive: true });
+        fs.writeFileSync(answered, fs.readFileSync(path.join(root, low)));
+        fs.writeFileSync(answered.replace(/_prompt\.json$/, '_response.json'), JSON.stringify({
+            responses: { simple: { content: 'paid answer', finishReason: 'stop' } },
+        }));
+
+        const { logs, io } = capture();
+        main({ DATA_DIR: root, OUT: out, STICKY: '1', CAP: '1' }, [], io);
+        assert.match(logs.join('\n'), /pinned: 1/);
+        assert.equal(fs.existsSync(path.join(out, low)), true);
+        const manifest = JSON.parse(fs.readFileSync(path.join(out, MANIFEST_NAME), 'utf8'));
+        assert.equal(manifest.kept.length, 1);
+        assert.equal(manifest.kept[0].relPath, low);
+        assert.equal(manifest.kept[0].pinned, true);
+        // The paid answer survived the keep-set rewrite.
+        assert.equal(fs.existsSync(answered.replace(/_prompt\.json$/, '_response.json')), true);
     });
 
     it('writes PROM_FILE after a completed run, including dry-run', () => {

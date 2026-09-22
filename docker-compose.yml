@@ -253,3 +253,65 @@ services:
       - /srv/trace-data:/data/traces
 
     mem_limit: 1g
+
+  # One-shot build: dedup (sticky, resolved-only) → teacher answers →
+  # validation → regenerate fail/wrong answers → export. Idempotent, so a
+  # review pass (`query -v -R`) followed by another run only redoes the
+  # reset txs. Does not start with `up`:
+  #   docker compose --profile build-dataset run --rm build-dataset
+  #   docker compose --profile build-dataset run --rm -e STAGES=gen,validate,export build-dataset
+  # This file is a reference. The deployment that actually runs is
+  # devops/ccmainnet3/mainnet_tsa_build/docker-compose.override.yml.
+  build-dataset:
+    build:
+      context: .
+      dockerfile: Dockerfile.build_dataset
+    image: colibri/trace-build-dataset:latest
+    container_name: trace-build-dataset
+    profiles: [ "build-dataset" ]
+    restart: "no"
+
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://193.26.158.2:3100/loki/api/v1/push"
+        loki-batch-size: "400"
+        loki-external-labels: "chain=mainnet,type=trace-build-dataset"
+
+    environment:
+      DATA_DIR: "/data/traces"
+      # Default TRAIN_DIR is <DATA_DIR>/train, DATASET_OUT <TRAIN_DIR>/dataset.
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?DEEPSEEK_API_KEY is required (set it in .env or export it)}
+      DEEPSEEK_BASE_URL: "https://api.deepseek.com"
+      MODEL: "deepseek-v4-pro"
+      STYLES: "simple"
+      THINKING: "enabled"
+      REASONING_EFFORT: "high"
+      MAX_TOKENS: "16384"
+      CONCURRENCY: "4"
+      MAX_RETRIES: "5"
+      TIMEOUT_MS: "600000"
+      KEEP_REASONING: "1"
+      PROGRESS_EVERY: "100"
+      CAP: "5"
+      REQUIRE_RESOLVED: "tx,events"
+      STICKY: "1"
+      REGEN_ROUNDS: "1"
+      MIN_GROUNDING_RATIO: "0.7"
+      REQUIRE_VALIDATION: "1"
+      JUDGE_SAMPLE_PCT: "5"
+      JUDGE_MODEL: "deepseek-v4-pro"
+      JUDGE_THINKING: "enabled"
+      JUDGE_REASONING_EFFORT: "high"
+      JUDGE_MAX_TOKENS: "16384"
+      LIMIT: ""
+      FORCE: ""
+      STAGES: ""
+      CHAIN: "mainnet"
+      PROM_FILE: "/metrics/trace_dedup_mainnet.prom"
+
+    volumes:
+      - /srv/trace-data:/data/traces
+      - /srv/node_exporter/textfile:/metrics
+
+    mem_limit: 2g

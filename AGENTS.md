@@ -1,6 +1,6 @@
 # Agent notes
 
-This repo builds **training prompts and teacher responses** for an SLM that explains Ethereum transactions. It is a small Node toolchain, not an app: collector → prepare → query → dedup → gen-responses → validate-responses → export-dataset.
+This repo builds **training prompts and teacher responses** for an SLM that explains Ethereum transactions. It is a small Node toolchain, not an app: collector → prepare → query, then `build_dataset` (dedup → gen-responses → validate-responses → export-dataset).
 
 Read `README.md` for the human-facing pipeline and env vars. This file is for changing the code without breaking layout, CAP accounting, or the explainer contract.
 
@@ -17,10 +17,11 @@ All runnable code lives in `src/`. Tests stay in `test/` and import from `../src
 | `src/gen_responses.mjs` | Call DeepSeek Chat Completions with the student prompt; write sibling `_response.json`. `fetch` is injectable for tests. |
 | `src/validate_responses.mjs` | Deterministic number grounding of `_response.json` against the prompt plus a seed-stable sampled DeepSeek judge; writes sibling `_validation.json`. Imports `callDeepSeek` / `runPool` from `gen_responses.mjs` and the sibling-path helpers from `query.mjs`. |
 | `src/export_dataset.mjs` | Pair `_prompt.json` + `_response.json`, emit `train.jsonl` / `val.jsonl` / `manifest.json` with a codehash-cohesive split. Optional gates on `_validation.json`. |
+| `src/build_dataset.mjs` | In-process orchestrator. Calls each stage's `main(env, argv, io, deps)`. `STAGES` selects a subset; pipeline-only defaults (`REQUIRE_RESOLVED`, `STICKY`, export gates, regen) are applied here and stay off in the standalone tools. |
 | `src/bucket_paths.mjs` | **Single source of truth** for on-disk layout. |
 | `src/proxy_accesslist.mjs` | Access list + proxy implementation resolution. |
 | `src/sim-from-trace.mjs` | Collector file → Colibri simulation JSON. |
-| `Dockerfile.traces` / `Dockerfile.prepare` / `Dockerfile.dedup` / `Dockerfile.gen_responses` / `Dockerfile.validate_responses` | COPY the needed `src/*.mjs` files into `/app` (flattened). Collector, dedup, gen-responses, and validate-responses are alpine+node only. Prepare sparse-checkouts the explainer. Dedup copies `dedup.mjs`, `query.mjs`, `bucket_paths.mjs`. Gen-responses copies `gen_responses.mjs`, `query.mjs`, `bucket_paths.mjs`. Validate-responses copies those three plus `validate_responses.mjs`. |
+| `Dockerfile.traces` / `Dockerfile.prepare` / `Dockerfile.dedup` / `Dockerfile.gen_responses` / `Dockerfile.validate_responses` / `Dockerfile.build_dataset` | COPY the needed `src/*.mjs` files into `/app` (flattened). Collector, dedup, gen-responses, validate-responses, and build-dataset are alpine+node only. Prepare sparse-checkouts the explainer. Dedup copies `dedup.mjs`, `query.mjs`, `bucket_paths.mjs`. Gen-responses copies `gen_responses.mjs`, `query.mjs`, `bucket_paths.mjs`. Validate-responses copies those three plus `validate_responses.mjs`. Build-dataset copies `build_dataset.mjs`, `dedup.mjs`, `gen_responses.mjs`, `validate_responses.mjs`, `export_dataset.mjs`, `query.mjs`, `bucket_paths.mjs`. |
 | `test/*.test.mjs` | `node:test`. No network. Use temp dirs. |
 
 Everything is ESM (`.mjs`). Docker images do not use `package.json` `"type": "module"`; the `.mjs` suffix is enough.
@@ -89,10 +90,21 @@ The explainer lives **outside** this repo (`EXPLAINER_DIR`). Docker sets `SKIP_E
 - First userPrompt only. Skip files without a `code` section C4 source body (and skip `_prompt.nosrc`).
 - Cluster key is `<path method_id>:<sha256 of canonical public/external function+event signatures>`. Events/state/call do not affect the key.
 - `qualityScore(hit)` is `gasUsed/1e5 + eventCount/3 + callCount/5 + stateChangeCount/10` from the first userPrompt sections (gas thousands-separators stripped). Per-cluster CAP keeps highest scores; ties keep the lexicographically first `relPath`.
+- `REQUIRE_RESOLVED` (default empty = off) skips candidates for which `isSectionResolved` is false on a listed section, counted as `skippedUnresolved` in the summary, manifest, and `trace_dedup_skipped_unresolved`. This replaces deleting unresolved txs with `query -E -X`.
+- `STICKY=1` (default off; the build pipeline sets it) pins a candidate when `OUT` already has a readable `_response.json` at the same `relPath`. `selectByCap(candidates, cap, { pinned })` sorts pinned first, then `compareKeep`, and never exceeds `cap`. Kept manifest entries carry `pinned`. `copyKeepers` still deletes only prompts and sims, so the paid answer survives the rewrite.
 - Index only metadata after scoring — do not retain every userPrompt in memory.
 - `OUT` must not be `DATA_DIR` or a parent of it. A `train/` subdirectory under DATA_DIR is safe (`walkBuckets` ignores non-hex top-level names).
-- Keep-set copy: `_prompt.json` plus sibling `_sim.json` when present. Do not copy collector traces. Missing sims are skipped.
+- Keep-set copy: `_prompt.json` plus sibling `_sim.json` when present. Do not copy collector traces. Missing sims are skipped. Do not delete `_response.json` / `_validation.json`.
 - Prometheus: own `PROM_FILE` per process **and** chain. Write after every completed run (including `--dry-run`); skip help / early validation errors. Atomic `*.tmp` + rename.
+
+## Build-pipeline invariants (`src/build_dataset.mjs`)
+
+- Calls `dedup` / `gen` / `validate` / `export` `main()` in-process. No shell. `deps` (`fetch`, `sleep`, `rng`, `now`) are forwarded to gen and validate; tests never hit the network.
+- `STAGES` default `dedup,gen,validate,export`, always in that order. `dedup` reads `DATA_DIR` and writes `TRAIN_DIR` (default `<DATA_DIR>/train`; the server sets `/data/train` because the keep-set is a separate volume). Later stages read `TRAIN_DIR`. Export writes `DATASET_OUT` (default `<TRAIN_DIR>/dataset`, a non-hex name so `walkBuckets` ignores it).
+- Pipeline-only defaults, applied only when the env var is unset (an empty value turns them off): `REQUIRE_RESOLVED=tx,events`, `STICKY=1`, `REGEN_ROUNDS=1`, `MIN_GROUNDING_RATIO=0.7`, `REQUIRE_VALIDATION=1`. Standalone `export-dataset` keeps every gate off.
+- Regen, after validate, only when both `gen` and `validate` are in `STAGES`: a **fresh** check with `deterministic.verdict === 'fail'` or `judge.verdict === 'wrong'` is deleted via `unlinkResponseFiles` and generated again, at most `REGEN_ROUNDS` times. `warn` and `flawed` are not redone. `--dry-run` counts them and deletes nothing.
+- Reset `process.exitCode` before each stage. `dedup` or `export` failing aborts the pipeline. A gen/validate exit 1 (individual calls failed) is remembered and the process exits 1 at the end. A missing `DEEPSEEK_API_KEY` fails before any write when a live gen or judge sample is planned.
+- `--dry-run` is forwarded to every stage. A dry-run dedup does not create `TRAIN_DIR`; later stages are skipped with a log line instead of failing their directory check.
 
 ## Teacher-response invariants (`src/gen_responses.mjs`)
 

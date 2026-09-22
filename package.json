@@ -9,6 +9,7 @@
         "gen-responses": "node src/gen_responses.mjs",
         "validate-responses": "node src/validate_responses.mjs",
         "export-dataset": "node src/export_dataset.mjs",
+        "build-dataset": "node src/build_dataset.mjs",
         "test": "node --test test/*.test.mjs"
     },
     "dependencies": {

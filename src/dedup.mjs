@@ -16,6 +16,9 @@ import {
     splitSections,
     sectionText,
     simPathForPrompt,
+    isSectionResolved,
+    parseSectionList,
+    readResponse,
 } from './query.mjs';
 
 export const DEFAULT_CAP = 5;
@@ -43,6 +46,12 @@ Options:
   --keep <n>      Max prompts per cluster (overrides CAP; default ${DEFAULT_CAP})
   --dry-run       Print stats only; do not copy
   -h, --help      Show this help
+
+Env:
+  REQUIRE_RESOLVED  Comma list of sections (tx,events,state,call,code) that
+                    must be resolved; others are skipped (default: off)
+  STICKY            1 = keepers that already have a _response.json under OUT
+                    win their cluster slot before the quality score
 `;
 
 /**
@@ -124,6 +133,19 @@ export function resolveProgressEvery(env = process.env) {
     if (env.PROGRESS_EVERY === undefined || env.PROGRESS_EVERY === '') return DEFAULT_PROGRESS_EVERY;
     if (!/^\d+$/.test(String(env.PROGRESS_EVERY))) return DEFAULT_PROGRESS_EVERY;
     return Number(env.PROGRESS_EVERY);
+}
+
+/**
+ * Sections a candidate must have resolved, or `[]` when the filter is off.
+ * `REQUIRE_RESOLVED=` (empty) is off; an unknown section name throws.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @return {string[]}
+ */
+export function resolveRequireResolved(env = process.env) {
+    const raw = env.REQUIRE_RESOLVED;
+    if (raw === undefined || String(raw).trim() === '') return [];
+    return parseSectionList(String(raw), 'REQUIRE_RESOLVED');
 }
 
 /**
@@ -232,10 +254,12 @@ export function collectCandidates(root, opts = {}) {
     const onWarn = opts.onWarn;
     const onProgress = opts.onProgress;
     const progressEvery = opts.progressEvery || 0;
+    const requireResolved = Array.isArray(opts.requireResolved) ? opts.requireResolved : [];
     const candidates = [];
     let scanned = 0;
     let skippedNocode = 0;
     let skippedBad = 0;
+    let skippedUnresolved = 0;
 
     walkBuckets(root, (dir, key) => {
         const bucket = key.match(BUCKET_KEY_RE);
@@ -278,6 +302,14 @@ export function collectCandidates(root, opts = {}) {
                 skippedNocode++;
                 continue;
             }
+            if (requireResolved.length) {
+                const parts = splitSections(userPrompt);
+                const unresolved = requireResolved.filter((key) => !isSectionResolved(parts, key));
+                if (unresolved.length) {
+                    skippedUnresolved++;
+                    continue;
+                }
+            }
             const relPath = path.relative(root, absPath);
             const hit = { relPath, absPath, userPrompt, methodId, codeSection };
             const score = Number(scoreFn(hit));
@@ -298,17 +330,25 @@ export function collectCandidates(root, opts = {}) {
         }
     });
 
-    return { candidates, scanned, skippedNocode, skippedBad };
+    return { candidates, scanned, skippedNocode, skippedBad, skippedUnresolved };
 }
 
 /**
  * Highest `score` first; `relPath` ascending on ties. Slice to `cap`.
  *
+ * `opts.pinned` is a set of `relPath`s that already have a teacher response.
+ * Pinned candidates take cluster slots before the score sort, so a paid
+ * answer is not evicted by a newer, richer trace. Among pinned (and among
+ * the rest) `compareKeep` still applies, and `cap` is never exceeded.
+ * Kept entries gain `pinned: true|false`; inputs are not mutated.
+ *
  * @param {Array<{ relPath: string, cluster: string, score: number }>} candidates
  * @param {number} cap
- * @return {{ kept: typeof candidates, dropped: typeof candidates }}
+ * @param {{ pinned?: Set<string> }} [opts]
+ * @return {{ kept: Array<object>, dropped: Array<object> }}
  */
-export function selectByCap(candidates, cap) {
+export function selectByCap(candidates, cap, opts = {}) {
+    const pinned = opts.pinned instanceof Set ? opts.pinned : new Set();
     const groups = new Map();
     for (const c of candidates) {
         let list = groups.get(c.cluster);
@@ -321,9 +361,16 @@ export function selectByCap(candidates, cap) {
     const kept = [];
     const dropped = [];
     for (const list of groups.values()) {
-        list.sort(compareKeep);
-        kept.push(...list.slice(0, cap));
-        dropped.push(...list.slice(cap));
+        list.sort((a, b) => {
+            const pa = pinned.has(a.relPath) ? 1 : 0;
+            const pb = pinned.has(b.relPath) ? 1 : 0;
+            if (pa !== pb) return pb - pa;
+            return compareKeep(a, b);
+        });
+        const chosen = list.slice(0, cap).map((c) => ({ ...c, pinned: pinned.has(c.relPath) }));
+        const rest = list.slice(cap).map((c) => ({ ...c, pinned: pinned.has(c.relPath) }));
+        kept.push(...chosen);
+        dropped.push(...rest);
     }
     kept.sort((a, b) => a.relPath.localeCompare(b.relPath));
     dropped.sort((a, b) => a.relPath.localeCompare(b.relPath));
@@ -358,7 +405,9 @@ export function assertSafeOutDir(dataDir, outDir) {
 
 /**
  * Copy keepers with the same relative layout. Overwrites previous keep-set
- * `_prompt.json` and sibling `_sim.json` under OUT.
+ * `_prompt.json` and sibling `_sim.json` under OUT. Teacher `_response.json`
+ * and `_validation.json` files are left in place so a sticky re-run does not
+ * throw away answers that were already paid for.
  *
  * @param {string} outDir
  * @param {Array<{ relPath: string, absPath: string }>} kept
@@ -410,8 +459,10 @@ export function formatSummary(stats) {
         `scanned: ${stats.scanned}`,
         `skipped-nocode: ${stats.skippedNocode}`,
         `skipped-bad: ${stats.skippedBad}`,
+        `skipped-unresolved: ${stats.skippedUnresolved || 0}`,
         `clusters: ${clusterCounts.size}`,
         `kept: ${stats.kept.length}`,
+        `pinned: ${stats.kept.filter((k) => k.pinned).length}`,
         `dropped: ${stats.dropped.length}`,
         `cap: ${stats.cap}`,
     ];
@@ -444,12 +495,18 @@ export function formatMetrics(stats, chain = 'mainnet') {
         '# HELP trace_dedup_skipped_bad Prompts skipped as unreadable or unscorable in the last run.',
         '# TYPE trace_dedup_skipped_bad gauge',
         `trace_dedup_skipped_bad${labels} ${stats.skippedBad}`,
+        '# HELP trace_dedup_skipped_unresolved Prompts skipped because a REQUIRE_RESOLVED section was not decoded.',
+        '# TYPE trace_dedup_skipped_unresolved gauge',
+        `trace_dedup_skipped_unresolved${labels} ${stats.skippedUnresolved || 0}`,
         '# HELP trace_dedup_clusters Distinct (method_id × interface) clusters in the last run.',
         '# TYPE trace_dedup_clusters gauge',
         `trace_dedup_clusters${labels} ${stats.clusters}`,
         '# HELP trace_dedup_kept Prompts selected for the keep-set in the last run.',
         '# TYPE trace_dedup_kept gauge',
         `trace_dedup_kept${labels} ${stats.kept}`,
+        '# HELP trace_dedup_pinned Kept prompts that already had a teacher response (STICKY).',
+        '# TYPE trace_dedup_pinned gauge',
+        `trace_dedup_pinned${labels} ${stats.pinned || 0}`,
         '# HELP trace_dedup_dropped Prompts above CAP in the last run.',
         '# TYPE trace_dedup_dropped gauge',
         `trace_dedup_dropped${labels} ${stats.dropped}`,
@@ -522,8 +579,10 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
     }
 
     let cap;
+    let requireResolved;
     try {
         cap = resolveCap(env, flags);
+        requireResolved = resolveRequireResolved(env);
     } catch (e) {
         io.error(e.message);
         process.exitCode = 1;
@@ -546,21 +605,25 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
         }
     }
 
-    io.log(`dedup: scanning ${dataDir} cap=${cap}${flags.dryRun ? ' dry-run' : ''}`);
+    const sticky = env.STICKY === '1';
+    io.log(`dedup: scanning ${dataDir} cap=${cap}${requireResolved.length ? ` resolved=${requireResolved.join(',')}` : ''}${sticky ? ' sticky' : ''}${flags.dryRun ? ' dry-run' : ''}`);
     const collected = collectCandidates(dataDir, {
         qualityScore: opts.qualityScore || qualityScore,
         onWarn: (msg) => io.error(msg),
         onProgress: (msg) => io.log(msg),
         progressEvery: resolveProgressEvery(env),
+        requireResolved,
     });
     const clusters = new Set(collected.candidates.map((c) => c.cluster)).size;
-    io.log(`dedup: scanned ${collected.scanned}, ${clusters} clusters, selecting cap=${cap}`);
-    const { kept, dropped } = selectByCap(collected.candidates, cap);
+    const pinned = sticky && outDir ? pinnedRelPaths(outDir, collected.candidates) : new Set();
+    io.log(`dedup: scanned ${collected.scanned}, ${clusters} clusters, selecting cap=${cap}${pinned.size ? ` pinned=${pinned.size}` : ''}`);
+    const { kept, dropped } = selectByCap(collected.candidates, cap, { pinned });
 
     io.log(formatSummary({
         scanned: collected.scanned,
         skippedNocode: collected.skippedNocode,
         skippedBad: collected.skippedBad,
+        skippedUnresolved: collected.skippedUnresolved,
         cap,
         candidates: collected.candidates,
         kept,
@@ -576,6 +639,7 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
             scanned: collected.scanned,
             skippedNocode: collected.skippedNocode,
             skippedBad: collected.skippedBad,
+            skippedUnresolved: collected.skippedUnresolved,
             clusters,
             kept: kept.map((c) => ({
                 relPath: c.relPath,
@@ -583,6 +647,7 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
                 methodId: c.methodId,
                 score: c.score,
                 txFunction: c.txFunction,
+                pinned: !!c.pinned,
             })),
             dropped: dropped.map((c) => ({
                 relPath: c.relPath,
@@ -597,8 +662,10 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
         scanned: collected.scanned,
         skippedNocode: collected.skippedNocode,
         skippedBad: collected.skippedBad,
+        skippedUnresolved: collected.skippedUnresolved,
         clusters,
         kept: kept.length,
+        pinned: kept.filter((k) => k.pinned).length,
         dropped: dropped.length,
         cap,
         copied: flags.dryRun ? 0 : kept.length,
@@ -609,6 +676,22 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
         chain: env.CHAIN || 'mainnet',
         onError: (msg) => io.error(msg),
     });
+}
+
+/**
+ * relPaths under `outDir` that already have a readable `_response.json`.
+ * Missing files are not pinned; a corrupt response file is not either.
+ *
+ * @param {string} outDir
+ * @param {Array<{ relPath: string }>} candidates
+ * @return {Set<string>}
+ */
+function pinnedRelPaths(outDir, candidates) {
+    const pinned = new Set();
+    for (const c of candidates) {
+        if (readResponse(path.join(outDir, c.relPath))) pinned.add(c.relPath);
+    }
+    return pinned;
 }
 
 function dirExists(p) {

@@ -7,10 +7,7 @@ The pipeline is:
 1. **Collect** execution traces from a Geth node, sampled by contract bytecode and method.
 2. **Prepare** those traces into simulation JSON, then into two prompt styles (simple + detailed).
 3. **Query** the resulting prompts so you can inspect coverage and pick training examples.
-4. **Dedup** clusters similar contracts and copies a CAP-sized keep-set for training.
-5. **Teacher responses** are generated with `src/gen_responses.mjs` (DeepSeek API).
-6. **Validate** the responses with `src/validate_responses.mjs` (number grounding + sampled LLM judge).
-7. **Export** the paired prompts + responses as SFT JSONL with `src/export_dataset.mjs`.
+4. **Build the dataset** with `src/build_dataset.mjs`: dedup, teacher responses, validation, one regeneration pass, and the SFT export, in a single idempotent command. The sections below are the same stages runnable on their own.
 
 ```
 Geth (eth + debug)
@@ -24,13 +21,14 @@ src/prepare-testdata.mjs  →  <txhash>_sim.json      (step 1: simulation shape)
                           →  <txhash>_prompt.nosrc  (Sourcify miss, skip later)
         │
         ▼
-src/query.mjs             →  filter / dump prompts
-src/dedup.mjs             →  CAP keep-set under OUT (same layout)
+src/query.mjs             →  filter / dump prompts (review; not a build step)
         │
         ▼
-src/gen_responses.mjs     →  <txhash>_response.json   (teacher answers from DeepSeek)
-src/validate_responses.mjs→  <txhash>_validation.json (number grounding + judge)
-src/export_dataset.mjs    →  train.jsonl + val.jsonl + manifest.json (SFT dataset)
+src/build_dataset.mjs     →  dedup → gen → validate → regen → export
+   src/dedup.mjs          →  CAP keep-set under TRAIN_DIR
+   src/gen_responses.mjs  →  <txhash>_response.json
+   src/validate_responses.mjs → <txhash>_validation.json
+   src/export_dataset.mjs →  TRAIN_DIR/dataset/{train,val}.jsonl + manifest.json
 ```
 
 Requires **Node 18+** (Docker images use Node 22). No npm dependencies in this repo; the collector uses Node builtins only. Prompt generation needs the Colibri explainer from [colibri-stateless](https://github.com/corpus-core/colibri-stateless).
@@ -159,15 +157,46 @@ DATA_DIR=./test_data npm run query -- -q events:Approval -l 20
 | `-R` | Delete only `_response.json` + `_validation.json` of matching txs; prompt, sim, and trace stay, so the next `gen-responses` / `validate-responses` run regenerates them |
 | `-h` | Help |
 
-Review loop for teacher answers after `validate-responses`:
+Review loop after `build-dataset` (the keep-set is `TRAIN_DIR`, default `<DATA_DIR>/train`):
 
 ```bash
-DATA_DIR=./dedup node src/query.mjs -v -S          # how many flagged?
-DATA_DIR=./dedup node src/query.mjs -v -s -l 5     # read prompt, answer, and why it was flagged
-DATA_DIR=./dedup node src/query.mjs -v -R          # drop the flagged answers ...
-DATA_DIR=./dedup DEEPSEEK_API_KEY=sk-... npm run gen-responses       # ... and regenerate only those
-DATA_DIR=./dedup DEEPSEEK_API_KEY=sk-... npm run validate-responses
+DATA_DIR=./traces/train node src/query.mjs -v -S        # how many flagged?
+DATA_DIR=./traces/train node src/query.mjs -v -s -l 5   # read prompt, answer, and why
+DATA_DIR=./traces/train node src/query.mjs -v -R        # drop the flagged answers
+DATA_DIR=./traces STAGES=gen,validate,export npm run build-dataset   # redo only those
 ```
+
+`query -E tx -X` used to delete unresolved transactions from the source tree. Dedup now skips them (`REQUIRE_RESOLVED`) and leaves the traces in place.
+
+---
+
+## Build dataset — `src/build_dataset.mjs`
+
+One idempotent command for everything after `prepare`. `dedup` reads `DATA_DIR` and writes the keep-set to `TRAIN_DIR`; `gen`, `validate`, and `export` then work only there. Each stage skips work that is already fresh, so running it again after `query -R` regenerates just the reset transactions.
+
+Defaults that differ from the standalone tools: `REQUIRE_RESOLVED=tx,events` (unresolved prompts are skipped, not deleted), `STICKY=1` (an answered keeper keeps its cluster slot), `REGEN_ROUNDS=1` (answers with grounding `fail` or judge `wrong` are deleted and generated once more; `warn` and `flawed` stay), and the export gates `MIN_GROUNDING_RATIO=0.7` plus `REQUIRE_VALIDATION=1`. Set a variable to empty (`REQUIRE_RESOLVED=`) to turn that default off. The standalone `export-dataset` still exports everything when those gates are unset.
+
+```bash
+DATA_DIR=./traces node src/build_dataset.mjs --dry-run
+DATA_DIR=./traces DEEPSEEK_API_KEY=sk-... npm run build-dataset
+DATA_DIR=./traces STAGES=gen,validate,export npm run build-dataset
+```
+
+| Env / flag | Default | Meaning |
+| --- | --- | --- |
+| `DATA_DIR` | *(required)* | Prompt tree from prepare |
+| `TRAIN_DIR` | `<DATA_DIR>/train` | Dedup keep-set. On the server this is the separate `/data/train` volume |
+| `DATASET_OUT` | `<TRAIN_DIR>/dataset` | `train.jsonl`, `val.jsonl`, `manifest.json` |
+| `STAGES` | `dedup,gen,validate,export` | Subset, always run in that order |
+| `REGEN_ROUNDS` | `1` | Redo passes for `fail` / judge `wrong` (`0` = off) |
+| `REQUIRE_RESOLVED` | `tx,events` | Forwarded to dedup |
+| `STICKY` | `1` | Forwarded to dedup |
+| `MIN_GROUNDING_RATIO` / `REQUIRE_VALIDATION` | `0.7` / `1` | Export gates for this pipeline only |
+| `--dry-run` | | Forwarded to every stage; no copies, no API calls, no writes |
+
+`dedup` or `export` failing stops the run. A teacher or judge call that fails after retries is logged and the other stages still run; the process then exits 1.
+
+The deployment that actually runs is `devops/ccmainnet3/mainnet_tsa_build` (`dc --profile build run --rm mainnet_tsa_build`). `docker-compose.yml` in this repo is the reference copy of that service.
 
 ---
 
@@ -188,13 +217,15 @@ DATA_DIR=./test_data npm run dedup -- --out ./train_data --keep 1
 | `DATA_DIR` | *(required)* | Prompt tree (read-only) |
 | `OUT` / `--out` | *(required unless `--dry-run`)* | Keep-set root; same sharding as `DATA_DIR` |
 | `CAP` / `--keep` | `5` | Max prompts per (method × interface) cluster |
+| `REQUIRE_RESOLVED` | *(off)* | Comma list (`tx,events,...`); candidates whose section is not decoded are skipped and counted as `skipped-unresolved` |
+| `STICKY` | *(off)* | `1`: a keeper that already has a `_response.json` under `OUT` keeps its cluster slot ahead of the quality score |
 | `PROM_FILE` | *(off)* | Prometheus textfile path (own file; do not share with collector/prepare) |
 | `CHAIN` | `mainnet` | Metric label |
 | `PROGRESS_EVERY` | `5000` | Log `dedup: scanned N ...` every N prompt files (`0` = off) |
 | `--dry-run` | | Stats only; no copy |
 | `-h` | | Help |
 
-`OUT` must not be `DATA_DIR` (or a parent of it). A subdirectory such as `DATA_DIR/train` is fine: `walkBuckets` ignores names that are not a 2-hex prefix. Each run overwrites previous keep-set `_prompt.json` and sibling `_sim.json` files under `OUT` and writes `OUT/.dedup-manifest.json`.
+`OUT` must not be `DATA_DIR` (or a parent of it). A subdirectory such as `DATA_DIR/train` is fine: `walkBuckets` ignores names that are not a 2-hex prefix. Each run overwrites previous keep-set `_prompt.json` and sibling `_sim.json` files under `OUT` and writes `OUT/.dedup-manifest.json`. `_response.json` and `_validation.json` are not touched, so a sticky re-run keeps the answers already paid for. The manifest's `kept[]` entries carry `pinned: true` for those.
 
 ---
 
@@ -369,18 +400,18 @@ Typical feasibility-study setting: `MIN_GROUNDING_RATIO=0.7` drops the `fail` ve
 | `dedup` | `Dockerfile.dedup` | One-shot `src/dedup.mjs`; profile `dedup`, does not start with `up` |
 | `gen-responses` | `Dockerfile.gen_responses` | One-shot `src/gen_responses.mjs`; profile `gen-responses`, does not start with `up`. Reads the deduped keep-set at `/data/traces/train` and writes sibling `_response.json` files via the DeepSeek API |
 | `validate-responses` | `Dockerfile.validate_responses` | One-shot `src/validate_responses.mjs`; profile `validate-responses`, does not start with `up`. Writes sibling `_validation.json` files; only the judge sample (`JUDGE_SAMPLE_PCT`, default 5 %) needs the API |
+| `build-dataset` | `Dockerfile.build_dataset` | One-shot `src/build_dataset.mjs`; profile `build-dataset`, does not start with `up`. The normal way to run dedup + gen + validate + export |
 
 ```bash
+docker compose --profile build-dataset run --rm build-dataset
+docker compose --profile build-dataset run --rm -e STAGES=gen,validate,export build-dataset
+# The single-stage profiles are still there for debugging:
 docker compose --profile dedup run --rm dedup
-DEEPSEEK_API_KEY=sk-... docker compose --profile gen-responses run --rm gen-responses
-# Or put DEEPSEEK_API_KEY into an `.env` next to docker-compose.yml and just:
 docker compose --profile gen-responses run --rm gen-responses
-docker compose --profile validate-responses run --rm validate-responses
-# Deterministic-only pass (no API traffic):
 docker compose --profile validate-responses run --rm -e JUDGE_SAMPLE_PCT=0 validate-responses
 ```
 
-Dedup writes to `OUT=/data/traces/train` on the same volume; `gen-responses` reads from that path and drops `_response.json` beside every `_prompt.json`; `validate-responses` adds `_validation.json` next to it. Collector, prepare, and dedup must **not** share a `PROM_FILE` (`gen-responses` / `validate-responses` do not write metrics yet). Compose host paths and Loki labels are environment-specific — edit them before `docker compose up`. `DEEPSEEK_API_KEY` is required for the `gen-responses` and `validate-responses` profiles; compose fails loudly if it is unset.
+`docker-compose.yml` here is a reference (host paths `/srv/trace-data`). The compose files that deploy are `devops/ccmainnet3/mainnet_tsa_{crawler,prepare,build}/docker-compose.override.yml`: traces and the keep-set are separate named volumes, and `DEEPSEEK_API_KEY` comes from `ccmainnet3/.env.local` on the host. Collector, prepare, and dedup must **not** share a `PROM_FILE` (`build-dataset` writes the dedup textfile). `DEEPSEEK_API_KEY` is required for the `build-dataset`, `gen-responses`, and `validate-responses` profiles; compose fails loudly if it is unset.
 
 ---
 

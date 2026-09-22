@@ -150,8 +150,14 @@ describe('number canonicalisation', () => {
         assert.equal(canonicalNumber('1e18'), '1000000000000000000');
         assert.equal(canonicalNumber('2.5e6'), '2500000');
         assert.equal(canonicalNumber('1.5e-3'), '0.0015');
+        assert.equal(canonicalNumber('1e-1'), '0.1');
         assert.equal(canonicalNumber('abc'), null);
         assert.equal(canonicalNumber('1.'), null);
+        // A Solidity hex digit `e` is not an exponent. Expanding it would
+        // ask String.repeat for ~10^14 zeros and throw RangeError.
+        assert.equal(canonicalNumber('001e848000000000000'), null);
+        assert.equal(canonicalNumber('1e' + '9'.repeat(20)), null);
+        assert.equal(canonicalNumber('1e-400'), null);
     });
 
     it('scaleUp / scaleDown are exact on long integers', () => {
@@ -183,6 +189,9 @@ describe('extractNumbers', () => {
         assert.deepEqual(extractNumbers(text), ['1000', '66529']);
         assert.equal(maskNonNumeric('0xdead...beef 12'), '  12');
         assert.equal(maskNonNumeric('dead...beef 12').trim(), '12');
+        const blob = 'hex"001e848000000000000f0ba30000fc73" then 12 wei';
+        assert.deepEqual(extractNumbers(blob), ['12']);
+        assert.doesNotThrow(() => buildPromptIndex(blob));
     });
 
     it('drops trivial integers but never fractions; keeps duplicates', () => {
@@ -510,7 +519,7 @@ describe('main', () => {
         };
         const env = { DATA_DIR: root, DEEPSEEK_API_KEY: 'k', JUDGE_SAMPLE_PCT: '100', CONCURRENCY: '1', PROGRESS_EVERY: '0', JUDGE_MODEL: 'judge-m' };
         let cap = capture(); prevExit = cap.prev;
-        await main(env, ['--limit', '1'], cap.io, { fetch, sleep: async () => {}, now: () => 5_000 });
+        await main(env, ['--limit', '1'], cap.io, { fetch, sleep: async () => { }, now: () => 5_000 });
         assert.equal(process.exitCode, undefined);
         assert.equal(calls, 1, 'LIMIT caps judge calls');
         assert.equal(bodies[0].model, 'judge-m');
@@ -532,19 +541,19 @@ describe('main', () => {
 
         // Second run: judges only the pending one, reuses the stored verdict.
         cap = capture();
-        await main(env, [], cap.io, { fetch, sleep: async () => {} });
+        await main(env, [], cap.io, { fetch, sleep: async () => { } });
         assert.equal(calls, 2);
         assert.ok(readValidation(pA).checks.simple.judge && readValidation(pB).checks.simple.judge);
 
         // Third run: nothing to do.
         cap = capture();
-        await main(env, [], cap.io, { fetch, sleep: async () => {} });
+        await main(env, [], cap.io, { fetch, sleep: async () => { } });
         assert.equal(calls, 2);
         assert.match(cap.logs.join('\n'), /skipped \(fresh\):\s+2/);
 
         // FORCE_JUDGE re-judges without touching the deterministic result.
         cap = capture();
-        await main({ ...env, FORCE_JUDGE: '1' }, [], cap.io, { fetch, sleep: async () => {} });
+        await main({ ...env, FORCE_JUDGE: '1' }, [], cap.io, { fetch, sleep: async () => { } });
         assert.equal(calls, 4);
     });
 
@@ -556,7 +565,7 @@ describe('main', () => {
         const fetch = async () => { calls++; return judgeResponse('I refuse to answer in JSON.'); };
         const env = { DATA_DIR: root, DEEPSEEK_API_KEY: 'k', JUDGE_SAMPLE_PCT: '100', PROGRESS_EVERY: '0' };
         let cap = capture(); prevExit = cap.prev;
-        await main(env, [], cap.io, { fetch, sleep: async () => {} });
+        await main(env, [], cap.io, { fetch, sleep: async () => { } });
         const j = readValidation(p).checks.simple.judge;
         assert.equal(j.verdict, 'unparseable');
         assert.equal(j.score, null);
@@ -564,7 +573,7 @@ describe('main', () => {
         assert.equal(j.rawContent, 'I refuse to answer in JSON.');
         assert.match(cap.logs.join('\n'), /unparseable=1/);
         cap = capture();
-        await main(env, [], cap.io, { fetch, sleep: async () => {} });
+        await main(env, [], cap.io, { fetch, sleep: async () => { } });
         assert.equal(calls, 2, 'unparseable results are retried');
     });
 
@@ -575,7 +584,7 @@ describe('main', () => {
         // Some models return partial JSON when the cap hits; it must not be trusted.
         const fetch = async () => judgeResponse('{"score":5,"verdict":"good"', { finishReason: 'length' });
         const cap = capture(); prevExit = cap.prev;
-        await main({ DATA_DIR: root, DEEPSEEK_API_KEY: 'k', JUDGE_SAMPLE_PCT: '100', PROGRESS_EVERY: '0' }, [], cap.io, { fetch, sleep: async () => {} });
+        await main({ DATA_DIR: root, DEEPSEEK_API_KEY: 'k', JUDGE_SAMPLE_PCT: '100', PROGRESS_EVERY: '0' }, [], cap.io, { fetch, sleep: async () => { } });
         const j = readValidation(p).checks.simple.judge;
         assert.equal(j.verdict, 'unparseable');
         assert.equal(j.score, null);
@@ -590,7 +599,7 @@ describe('main', () => {
         let calls = 0;
         const fetch = async () => { calls++; return { ok: false, status: 500, async text() { return 'boom'; } }; };
         const cap = capture(); prevExit = cap.prev;
-        await main({ DATA_DIR: root, DEEPSEEK_API_KEY: 'k', JUDGE_SAMPLE_PCT: '100', MAX_RETRIES: '1', PROGRESS_EVERY: '0' }, [], cap.io, { fetch, sleep: async () => {}, rng: () => 0.5 });
+        await main({ DATA_DIR: root, DEEPSEEK_API_KEY: 'k', JUDGE_SAMPLE_PCT: '100', MAX_RETRIES: '1', PROGRESS_EVERY: '0' }, [], cap.io, { fetch, sleep: async () => { }, rng: () => 0.5 });
         assert.equal(calls, 2);
         assert.equal(process.exitCode, 1);
         const v = readValidation(p);

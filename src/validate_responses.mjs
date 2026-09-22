@@ -69,6 +69,9 @@ const TX_STEM_RE = /^(0x[0-9a-f]{64})_prompt\.json$/;
 // Masks applied before number extraction. Order matters: strip hex first so
 // the number regex never sees address / hash fragments.
 const HEX_TOKEN_RE = /0x[0-9a-fA-F]+(?:\.\.\.[0-9a-fA-F]+)?/g;
+// Solidity `hex"001e84…"` blobs. The `e` is a hex digit, not an exponent;
+// leaving them in makes `001e8480…` look like scientific notation.
+const SOLIDITY_HEX_LITERAL_RE = /\bhex"[0-9a-fA-F_]*"/gi;
 const BARE_TRUNCATED_HEX_RE = /\b[0-9a-fA-F]{4,}\.\.\.[0-9a-fA-F]{4,}\b/g;
 const STANDARD_ID_RE = /\b(?:ERC|EIP|BEP|TRC|CAIP|BIP)[-\s]?\d+\b/gi;
 const NUMBER_TOKEN_RE = /(?<![A-Za-z0-9_.])\d[\d,_]*(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
@@ -233,11 +236,16 @@ export function sha256Hex(text) {
  * Canonical decimal string: no thousands separators, no leading zeros, no
  * trailing fractional zeros, no sign. Returns `null` for unparseable input.
  * Scientific notation (`1e18`, `2.5e6`) is expanded when it yields an
- * integer or a finite decimal.
+ * integer or a finite decimal. Exponents that would expand past
+ * `MAX_CANONICAL_DIGITS` return `null` instead of throwing: a Solidity
+ * `hex"001e84…"` blob is not a number, and `String.repeat` of that exponent
+ * raises `RangeError: Invalid string length`.
  *
  * @param {string} token
  * @return {string | null}
  */
+export const MAX_CANONICAL_DIGITS = 256;
+
 export function canonicalNumber(token) {
     if (typeof token !== 'string') return null;
     let s = token.replace(/[,_]/g, '').replace(/^[+-]/, '');
@@ -247,10 +255,15 @@ export function canonicalNumber(token) {
         const intPart = sci[1];
         const fracPart = sci[2] || '';
         const exp = Number(sci[3]);
+        if (!Number.isSafeInteger(exp)) return null;
         const digits = intPart + fracPart;
         const pointPos = intPart.length + exp;
-        if (pointPos < 0) {
-            s = '0.' + '0'.repeat(-pointPos) + digits;
+        if (pointPos <= 0) {
+            const zeros = -pointPos;
+            if (zeros + digits.length > MAX_CANONICAL_DIGITS) return null;
+            s = '0.' + '0'.repeat(zeros) + digits;
+        } else if (pointPos > MAX_CANONICAL_DIGITS) {
+            return null;
         } else if (pointPos >= digits.length) {
             s = digits + '0'.repeat(pointPos - digits.length);
         } else {
@@ -335,14 +348,16 @@ export function roundDecimalString(canonical, d, mode = 'round') {
 }
 
 /**
- * Remove hex tokens, truncated addresses, and standard identifiers (ERC-20,
- * EIP-1559) so the number extractor never sees their digits.
+ * Remove hex tokens, Solidity `hex"…"` literals, truncated addresses, and
+ * standard identifiers (ERC-20, EIP-1559) so the number extractor never
+ * sees their digits.
  *
  * @param {string} text
  * @return {string}
  */
 export function maskNonNumeric(text) {
     return String(text ?? '')
+        .replace(SOLIDITY_HEX_LITERAL_RE, ' ')
         .replace(HEX_TOKEN_RE, ' ')
         .replace(BARE_TRUNCATED_HEX_RE, ' ')
         .replace(STANDARD_ID_RE, ' ');

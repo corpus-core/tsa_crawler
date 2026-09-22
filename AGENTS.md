@@ -1,6 +1,6 @@
 # Agent notes
 
-This repo builds **training prompts and teacher responses** for an SLM that explains Ethereum transactions. It is a small Node toolchain, not an app: collector → prepare → query → dedup → gen-responses → export-dataset.
+This repo builds **training prompts and teacher responses** for an SLM that explains Ethereum transactions. It is a small Node toolchain, not an app: collector → prepare → query → dedup → gen-responses → validate-responses → export-dataset.
 
 Read `README.md` for the human-facing pipeline and env vars. This file is for changing the code without breaking layout, CAP accounting, or the explainer contract.
 
@@ -15,11 +15,12 @@ All runnable code lives in `src/`. Tests stay in `test/` and import from `../src
 | `src/query.mjs` | Read-only prompt filter. CLI is `parseArgs` / `main`; keep helpers exported for tests. |
 | `src/dedup.mjs` | Cluster prompts by (path method_id × interface hash); copy CAP keep-set to `OUT`. DATA_DIR is read-only. |
 | `src/gen_responses.mjs` | Call DeepSeek Chat Completions with the student prompt; write sibling `_response.json`. `fetch` is injectable for tests. |
-| `src/export_dataset.mjs` | Pair `_prompt.json` + `_response.json`, emit `train.jsonl` / `val.jsonl` / `manifest.json` with a codehash-cohesive split. |
+| `src/validate_responses.mjs` | Deterministic number grounding of `_response.json` against the prompt plus a seed-stable sampled DeepSeek judge; writes sibling `_validation.json`. Imports `callDeepSeek` / `runPool` from `gen_responses.mjs` and the sibling-path helpers from `query.mjs`. |
+| `src/export_dataset.mjs` | Pair `_prompt.json` + `_response.json`, emit `train.jsonl` / `val.jsonl` / `manifest.json` with a codehash-cohesive split. Optional gates on `_validation.json`. |
 | `src/bucket_paths.mjs` | **Single source of truth** for on-disk layout. |
 | `src/proxy_accesslist.mjs` | Access list + proxy implementation resolution. |
 | `src/sim-from-trace.mjs` | Collector file → Colibri simulation JSON. |
-| `Dockerfile.traces` / `Dockerfile.prepare` / `Dockerfile.dedup` / `Dockerfile.gen_responses` | COPY the needed `src/*.mjs` files into `/app` (flattened). Collector, dedup, and gen-responses are alpine+node only. Prepare sparse-checkouts the explainer. Dedup copies `dedup.mjs`, `query.mjs`, `bucket_paths.mjs`. Gen-responses copies `gen_responses.mjs`, `query.mjs`, `bucket_paths.mjs`. |
+| `Dockerfile.traces` / `Dockerfile.prepare` / `Dockerfile.dedup` / `Dockerfile.gen_responses` / `Dockerfile.validate_responses` | COPY the needed `src/*.mjs` files into `/app` (flattened). Collector, dedup, gen-responses, and validate-responses are alpine+node only. Prepare sparse-checkouts the explainer. Dedup copies `dedup.mjs`, `query.mjs`, `bucket_paths.mjs`. Gen-responses copies `gen_responses.mjs`, `query.mjs`, `bucket_paths.mjs`. Validate-responses copies those three plus `validate_responses.mjs`. |
 | `test/*.test.mjs` | `node:test`. No network. Use temp dirs. |
 
 Everything is ESM (`.mjs`). Docker images do not use `package.json` `"type": "module"`; the `.mjs` suffix is enough.
@@ -35,7 +36,7 @@ Canonical path:
 ```
 
 - Codehash and selector directories have **no `0x`**. Empty calldata selector is the directory `fallback`.
-- Collector traces match `^0x[0-9a-f]{64}\.json$`. `_sim.json`, `_prompt.json`, `_prompt.nosrc`, and `_response.json` are siblings, not traces. `listTraceFiles` must ignore them.
+- Collector traces match `^0x[0-9a-f]{64}\.json$`. `_sim.json`, `_prompt.json`, `_prompt.nosrc`, `_response.json`, and `_validation.json` are siblings, not traces. `listTraceFiles` must ignore them.
 - In-memory bucket id is `<64-hex-codehash>_<selector>` (`bucketKey`). CAP counting and query `-c`/`-m` depend on that.
 - Writes are atomic: `file.tmp` then `rename`. Never leave a half-written JSON as the final name.
 - `traces/`, `test_data/`, `train_data/`, and `sol_cache/` are gitignored. Do not commit them.
@@ -76,6 +77,11 @@ The explainer lives **outside** this repo (`EXPLAINER_DIR`). Docker sets `SKIP_E
 - `-c` / `-m` are OR within the flag; repeated `-q` is AND.
 - Section prefixes for `-q`: `tx`, `events`, `state`, `call`, `code` — must match `SECTION_HEADERS` in the explainer user prompt. If the explainer changes headings, update both.
 - `DATA_DIR` is required. Stream matches; do not load the whole tree into memory.
+- `responsePathForPrompt` / `validationPathForPrompt` / `readResponse` / `readValidation` / `hasValidationProblems` live here and are the canonical sibling helpers; `gen_responses`, `validate_responses`, and `export_dataset` import them instead of re-deriving paths.
+- `-s` appends, in this order and only when present: `_sim.json` (`SIM_COLOR`), the `_response.json` content per style (`RESPONSE_COLOR`, light green), the `_validation.json` summary (`VALIDATION_COLOR`, magenta). `-d` alone never reads those siblings.
+- `-v` is an additional AND filter: keep only txs where `hasValidationProblems` is true (deterministic verdict `!= pass`, or a judge entry whose verdict `!= good`, including `unparseable`). A missing `_validation.json` is *not* a problem. `-S` still counts against the whole dataset.
+- `-X` also removes `_response.json` and `_validation.json` so no orphaned siblings remain.
+- `-R` (`unlinkResponseFiles`) removes **only** `_response.json` + `_validation.json` of matching txs and never prunes directories; prompt/sim/trace stay so `gen-responses` regenerates the answer (it treats a missing response file as new work). `-R` is a no-op when `-X` is also set (already covered); with `-x` it removes trace + teacher output. Matching paths are still listed, like `-x`.
 
 ## Dedup invariants (`src/dedup.mjs`)
 
@@ -98,12 +104,28 @@ The explainer lives **outside** this repo (`EXPLAINER_DIR`). Docker sets `SKIP_E
 - `fetch`, `sleep`, `rng`, and `now` are injectable through `main`'s `deps` argument. All tests use mocks; no live DeepSeek call is ever made from `node:test`.
 - Atomic writes: `.tmp` + `rename` in `writeResponseEntry`.
 
+## Validation invariants (`src/validate_responses.mjs`)
+
+- Reads `_prompt.json` + `_response.json`, writes only `<txhash>_validation.json` (atomic `.tmp` + rename, merged per style like `writeResponseEntry`). Never touches responses or prompts.
+- A check is **fresh** when `contentSha256 === sha256(response.content)`. Fresh checks are skipped unless `FORCE=1`. Changing the prompt does not by itself invalidate the deterministic check (the response text is what is graded); `promptSha256` is stored for drift inspection only.
+- Number extraction masks hex tokens, truncated addresses (`0x2127...e880`, `2127...e880`), and standard ids (`ERC-20`, `EIP-1559`) **before** matching digits, and rejects tokens preceded by `[A-Za-z0-9_.]` (so `v3`, `X96`, `uint256` never count). Integers `<= TRIVIAL_MAX` are dropped; fractions never are. `1.0` canonicalises to `1` and is therefore trivial.
+- Grounding modes, checked in order: `literal`, `hex` (BigInt of any full `0x…` token ≤ 32 bytes), `scaled` (× or ÷ `10^k` for `k` in `SCALE_EXPONENTS`), `decimals` (the `k` that links an `x (raw: y)` pair), `rounded` (a fractional prompt value, literal or scaled-down, rounds half-up or truncates to the answer's own precision; integers only from `ROUNDED_MIN_INT = 100`). Sums, differences, prices, and percentages are intentionally **not** derived — they land in `unmatched` and the judge covers them.
+- All decimal arithmetic is string-based (`scaleUp` / `scaleDown` / `roundDecimalString`). Never route uint256 values through `Number`.
+- `ratio = grounded / total`; `total === 0` is a `pass` with ratio 1. Verdict: `pass` ≥ `RATIO_PASS`, `warn` ≥ `RATIO_WARN`, else `fail`. `RATIO_WARN <= RATIO_PASS` is enforced.
+- Judge sample is `sha256(JUDGE_SEED || "\0judge\0" || lower(txhash))` mapped to `[0,100)` and compared with `JUDGE_SAMPLE_PCT`; raising the percentage only adds txs. A usable judge result (verdict `!= unparseable`) is reused; `unparseable` is retried on the next run; `FORCE_JUDGE=1` (or `FORCE=1`) re-judges.
+- The judge receives the same user prompt wrapped in `<<<SOURCE_DATA>>>` and the answer in `<<<ANALYST_ANSWER>>>`; both are data. It must reply with strict JSON `{score 1–5, verdict good|flawed|wrong, issues[]}`; `parseJudgeContent` tolerates fences/prose but never throws. `rawContent` (truncated) is stored only for unparseable replies.
+- No API key is needed when `JUDGE_SAMPLE_PCT=0` or nothing is planned; the run fails **before** writing anything if judge calls are planned without `DEEPSEEK_API_KEY`. `LIMIT` caps judge calls; capped txs keep their deterministic result with `judge: null` and are picked up next run.
+- HTTP, retry, backoff, and pool come from `gen_responses.mjs` (`callDeepSeek`, `runPool`); do not duplicate them. `fetch`, `sleep`, `rng`, `now` are injectable via `main`'s `deps`. Tests never call the network.
+- Exit code 1 only when a judge call failed after retries; deterministic results for that tx are still written.
+
 ## Export invariants (`src/export_dataset.mjs`)
 
 - One JSONL row per (prompt file × style): `messages = [system, user, assistant]` where `assistant.content` is exactly `entry.content`. **Never** put `reasoning_content` in the assistant message.
 - Skip when `entry.promptSha256` does not match the current prompt hash, when `entry.finishReason != "stop"`, or when `content` is empty. All skips are counted by reason in the manifest.
 - Split is deterministic: `sha256(SEED || codehash)` bucketed against `VAL_RATIO`. Every tx under the same codehash lands in the same split — do not weaken this or the val loss will underestimate generalisation.
 - `DATA_DIR` is read-only. The exporter writes only under `OUT` (`train.jsonl`, `val.jsonl`, `manifest.json`) with atomic writes.
+- Validation gates (`validationGate`) are all **off by default** and must never change the default export. A check whose `contentSha256` differs from the response content is stale and treated as missing. `REQUIRE_VALIDATION` / `REQUIRE_JUDGE_PASS` reject missing/stale checks (`no-validation` / `stale-validation`); `MIN_GROUNDING_RATIO` and `MIN_JUDGE_SCORE` only bite when a fresh check (resp. a judge result) exists. `REQUIRE_JUDGE_PASS` also rejects unjudged rows (`judge-not-good`).
+- `meta.validation` (`grounding_ratio`, `grounding_verdict`, `judge_score`, `judge_verdict`) is added to a row only when a fresh check exists. Manifest is `version: 2` and carries a `validation` block (gates, rows validated/judged, ratio mean/p10/p50, judge-score histogram).
 
 ## Coding rules
 

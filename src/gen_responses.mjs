@@ -14,7 +14,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { walkBuckets } from './bucket_paths.mjs';
-import { PROMPT_FILE_RE } from './query.mjs';
+import { PROMPT_FILE_RE, responsePathForPrompt } from './query.mjs';
+
+// Canonical path helper lives in query.mjs (shared with the read-only tools).
+export { responsePathForPrompt };
 
 export const DEFAULT_MODEL = 'deepseek-v4-pro';
 export const DEFAULT_BASE_URL = 'https://api.deepseek.com';
@@ -150,16 +153,6 @@ function parseNonNegativeInt(raw, fallback, name) {
         throw new Error(`${name} must be a non-negative integer (got ${raw})`);
     }
     return Number(raw);
-}
-
-/**
- * Sibling `_response.json` path for a `_prompt.json` path.
- *
- * @param {string} promptAbsPath
- * @return {string}
- */
-export function responsePathForPrompt(promptAbsPath) {
-    return promptAbsPath.replace(/_prompt\.json$/, RESPONSE_SUFFIX);
 }
 
 /**

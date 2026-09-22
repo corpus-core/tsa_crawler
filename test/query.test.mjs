@@ -26,10 +26,19 @@ import {
     simPathForPrompt,
     loadSimText,
     hasTraceCall,
+    responsePathForPrompt,
+    validationPathForPrompt,
+    readResponse,
+    readValidation,
+    hasValidationProblems,
+    formatResponse,
+    formatValidation,
     main,
     HELP,
     SECTION_COLOR,
     SIM_COLOR,
+    RESPONSE_COLOR,
+    VALIDATION_COLOR,
     RESET,
 } from '../src/query.mjs';
 
@@ -70,10 +79,12 @@ describe('parseArgs', () => {
             max: 99,
             details: true,
             sim: false,
+            validationProblems: false,
             random: false,
             stats: false,
             deleteTrace: false,
             deleteSiblings: false,
+            deleteResponses: false,
             help: false,
         });
         assert.deepEqual(parseArgs(['-q', 'approve', '-q', 'spender']).q, [
@@ -92,8 +103,8 @@ describe('parseArgs', () => {
         assert.deepEqual(parseArgs(['-x']).deleteTrace, true);
         assert.deepEqual(parseArgs(['-X']), {
             q: [], c: [], m: [], e: [], E: [],
-            details: false, sim: false, random: false, stats: false,
-            deleteTrace: true, deleteSiblings: true, help: false,
+            details: false, sim: false, validationProblems: false, random: false, stats: false,
+            deleteTrace: true, deleteSiblings: true, deleteResponses: false, help: false,
         });
         assert.deepEqual(parseArgs(['-s']), {
             q: [],
@@ -103,10 +114,12 @@ describe('parseArgs', () => {
             E: [],
             details: true,
             sim: true,
+            validationProblems: false,
             random: false,
             stats: false,
             deleteTrace: false,
             deleteSiblings: false,
+            deleteResponses: false,
             help: false,
         });
         assert.deepEqual(
@@ -119,10 +132,12 @@ describe('parseArgs', () => {
                 E: [],
                 details: false,
                 sim: false,
+                validationProblems: false,
                 random: false,
                 stats: false,
                 deleteTrace: false,
                 deleteSiblings: false,
+                deleteResponses: false,
                 help: false,
             },
         );
@@ -130,11 +145,16 @@ describe('parseArgs', () => {
             q: [], c: [], m: [],
             e: ['events', 'code'],
             E: ['state', 'tx'],
-            details: false, sim: false, random: false, stats: false,
-            deleteTrace: false, deleteSiblings: false, help: false,
+            details: false, sim: false, validationProblems: false, random: false, stats: false,
+            deleteTrace: false, deleteSiblings: false, deleteResponses: false, help: false,
         });
         assert.equal(parseArgs(['-S']).stats, true);
         assert.deepEqual(parseArgs(['-e', 'events', '-e', 'code,events']).e, ['events', 'code']);
+        const reset = parseArgs(['-R']);
+        assert.equal(reset.deleteResponses, true);
+        assert.equal(reset.deleteTrace, false);
+        assert.equal(reset.deleteSiblings, false);
+        assert.equal(parseArgs(['-v', '-R']).validationProblems, true);
     });
 
     it('parses help', () => {
@@ -430,6 +450,123 @@ describe('formatMatch', () => {
         assert.ok(colored.includes(`${SIM_COLOR}## Simulation${RESET}`));
         assert.ok(colored.includes(`${SIM_COLOR}  "status": "0x1"${RESET}`));
     });
+
+    it('appends response (light green) and validation (magenta) after the sim', () => {
+        const plain = formatMatch('a/b_prompt.json', 'hello', true, false, null, {
+            responseText: '## Response [simple]\nanswer',
+            validationText: '## Validation [simple] ok\n- numbers: pass ratio=1 (2/2)',
+        });
+        assert.equal(plain,
+            '=== a/b_prompt.json ===\nhello\n## Response [simple]\nanswer\n## Validation [simple] ok\n- numbers: pass ratio=1 (2/2)');
+        const colored = formatMatch('a/b_prompt.json', 'hello', true, true, '{}', {
+            responseText: '## Response [simple]\nanswer',
+            validationText: '## Validation [simple] ok',
+        });
+        assert.ok(colored.includes(`${RESPONSE_COLOR}answer${RESET}`));
+        assert.ok(colored.includes(`${VALIDATION_COLOR}## Validation [simple] ok${RESET}`));
+        // Order: prompt, sim, response, validation.
+        assert.ok(colored.indexOf('## Simulation') < colored.indexOf('## Response'));
+        assert.ok(colored.indexOf('## Response') < colored.indexOf('## Validation'));
+        // Absent extras add nothing.
+        assert.equal(formatMatch('p', 'hello', true, false, null, {}), '=== p ===\nhello');
+    });
+});
+
+describe('formatResponse / formatValidation', () => {
+    it('renders one block per style and flags non-stop finishes', () => {
+        const text = formatResponse({
+            responses: {
+                simple: { model: 'deepseek-v4-pro', content: 'short\n\n', finishReason: 'stop' },
+                detailed: { content: 'cut', finishReason: 'length' },
+            },
+        });
+        assert.equal(text, '## Response [simple] (deepseek-v4-pro)\nshort\n## Response [detailed] (finish=length)\ncut');
+        assert.equal(formatResponse({ responses: {} }), null);
+        assert.equal(formatResponse({ responses: { simple: { content: 42 } } }), null);
+    });
+
+    it('renders deterministic + judge lines and the PROBLEM flag', () => {
+        const ok = formatValidation({
+            checks: {
+                simple: {
+                    deterministic: { verdict: 'pass', numbers: { ratio: 1, grounded: 3, total: 3, unmatched: [] } },
+                    judge: null,
+                },
+            },
+        });
+        assert.equal(ok, '## Validation [simple] ok\n- numbers: pass ratio=1 (3/3)');
+
+        const bad = formatValidation({
+            checks: {
+                simple: {
+                    sampled: true,
+                    deterministic: { verdict: 'warn', numbers: { ratio: 0.75, grounded: 3, total: 4, unmatched: ['4.93'] } },
+                    judge: {
+                        model: 'deepseek-v4-pro', score: 3, verdict: 'flawed',
+                        issues: [{ type: 'wrong-number', quote: '4.93 USDT', explanation: 'sum not in data' }],
+                    },
+                },
+            },
+        });
+        assert.equal(bad, [
+            '## Validation [simple] PROBLEM',
+            '- numbers: warn ratio=0.75 (3/4)',
+            '  unmatched: 4.93',
+            '- judge: flawed score=3 (deepseek-v4-pro)',
+            '  * wrong-number: "4.93 USDT" — sum not in data',
+        ].join('\n'));
+
+        const pending = formatValidation({
+            checks: { simple: { sampled: true, deterministic: { verdict: 'pass', numbers: { ratio: 1, grounded: 0, total: 0, unmatched: [] } } } },
+        });
+        assert.match(pending, /judge: sampled, not run yet/);
+        assert.equal(formatValidation({ checks: {} }), null);
+    });
+});
+
+describe('readValidation / hasValidationProblems', () => {
+    let root;
+    afterEach(() => {
+        if (root) fs.rmSync(root, { recursive: true, force: true });
+        root = undefined;
+    });
+
+    it('derives sibling paths', () => {
+        assert.equal(responsePathForPrompt('/x/0xab_prompt.json'), '/x/0xab_response.json');
+        assert.equal(validationPathForPrompt('/x/0xab_prompt.json'), '/x/0xab_validation.json');
+    });
+
+    it('flags non-pass verdicts and non-good judges; missing file is not a problem', () => {
+        assert.equal(hasValidationProblems(null), false);
+        assert.equal(hasValidationProblems({ checks: {} }), false);
+        assert.equal(hasValidationProblems({ checks: { simple: { deterministic: { verdict: 'pass' }, judge: null } } }), false);
+        assert.equal(hasValidationProblems({ checks: { simple: { deterministic: { verdict: 'warn' } } } }), true);
+        assert.equal(hasValidationProblems({ checks: { simple: { deterministic: { verdict: 'fail' } } } }), true);
+        assert.equal(hasValidationProblems({ checks: { simple: { deterministic: { verdict: 'pass' }, judge: { verdict: 'good' } } } }), false);
+        assert.equal(hasValidationProblems({ checks: { simple: { deterministic: { verdict: 'pass' }, judge: { verdict: 'flawed' } } } }), true);
+        assert.equal(hasValidationProblems({ checks: { simple: { deterministic: { verdict: 'pass' }, judge: { verdict: 'unparseable' } } } }), true);
+        // Style filter.
+        const mixed = { checks: { simple: { deterministic: { verdict: 'pass' } }, detailed: { deterministic: { verdict: 'fail' } } } };
+        assert.equal(hasValidationProblems(mixed, ['simple']), false);
+        assert.equal(hasValidationProblems(mixed, ['detailed']), true);
+        assert.equal(hasValidationProblems(mixed), true);
+    });
+
+    it('readValidation / readResponse return null for missing or malformed files and warn only on parse errors', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'q-'));
+        const prompt = path.join(root, `${TX_A}_prompt.json`);
+        const warns = [];
+        assert.equal(readValidation(prompt, (m) => warns.push(m)), null);
+        assert.equal(readResponse(prompt, (m) => warns.push(m)), null);
+        assert.equal(warns.length, 0, 'ENOENT is silent');
+        fs.writeFileSync(validationPathForPrompt(prompt), '{bad');
+        fs.writeFileSync(responsePathForPrompt(prompt), '{"responses": "nope"}');
+        assert.equal(readValidation(prompt, (m) => warns.push(m)), null);
+        assert.equal(readResponse(prompt, (m) => warns.push(m)), null);
+        assert.equal(warns.length, 1, 'only the JSON parse error warns');
+        fs.writeFileSync(validationPathForPrompt(prompt), JSON.stringify({ checks: { simple: { deterministic: { verdict: 'fail' } } } }));
+        assert.equal(readValidation(prompt).checks.simple.deterministic.verdict, 'fail');
+    });
 });
 
 describe('visitMatchingPrompts', () => {
@@ -684,6 +821,8 @@ describe('main', () => {
         fs.writeFileSync(`${stem}_sim.json`, '{}');
         fs.writeFileSync(`${stem}_prompt.nosrc`, '{}\n');
         fs.writeFileSync(`${stem}_sim.nosrc`, '{}\n');
+        fs.writeFileSync(`${stem}_response.json`, '{"responses":{}}\n');
+        fs.writeFileSync(`${stem}_validation.json`, '{"checks":{}}\n');
 
         const { errors, io } = capture();
         main({ DATA_DIR: root }, ['-t', '0', '-X'], io);
@@ -692,8 +831,105 @@ describe('main', () => {
         assert.equal(fs.existsSync(`${stem}_sim.json`), false);
         assert.equal(fs.existsSync(`${stem}_prompt.nosrc`), false);
         assert.equal(fs.existsSync(`${stem}_sim.nosrc`), false);
+        assert.equal(fs.existsSync(`${stem}_response.json`), false);
+        assert.equal(fs.existsSync(`${stem}_validation.json`), false);
         assert.equal(fs.existsSync(path.join(root, HASH.slice(0, 2))), false);
         assert.equal(fs.existsSync(root), true);
         assert.match(errors.join('\n'), /delete: done 1 txs/);
+    });
+
+    it('-R removes only _response.json and _validation.json; combines with -v', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'query-'));
+        const relBad = writePrompt(root, TX_A, 'Function: approve');
+        const relOk = writePrompt(root, TX_B, 'Function: approve');
+        const relNoResp = writePrompt(root, TX_C, 'Function: approve');
+        const stem = (rel) => path.join(root, rel).replace(/_prompt\.json$/, '');
+        for (const rel of [relBad, relOk]) {
+            fs.writeFileSync(`${stem(rel)}.json`, '{"trace":{}}');
+            fs.writeFileSync(`${stem(rel)}_sim.json`, '{}');
+            fs.writeFileSync(`${stem(rel)}_response.json`, '{"responses":{}}');
+        }
+        fs.writeFileSync(`${stem(relBad)}_validation.json`, JSON.stringify({ checks: { simple: { deterministic: { verdict: 'fail' } } } }));
+        fs.writeFileSync(`${stem(relOk)}_validation.json`, JSON.stringify({ checks: { simple: { deterministic: { verdict: 'pass' } } } }));
+
+        // Only the flagged tx loses its teacher output.
+        let cap = capture();
+        main({ DATA_DIR: root }, ['-v', '-R'], cap.io);
+        assert.deepEqual(cap.logs, [relBad], 'matching paths are still listed');
+        assert.equal(fs.existsSync(`${stem(relBad)}_response.json`), false);
+        assert.equal(fs.existsSync(`${stem(relBad)}_validation.json`), false);
+        assert.equal(fs.existsSync(`${stem(relBad)}_prompt.json`), true, 'prompt stays');
+        assert.equal(fs.existsSync(`${stem(relBad)}_sim.json`), true, 'sim stays');
+        assert.equal(fs.existsSync(`${stem(relBad)}.json`), true, 'trace stays');
+        assert.equal(fs.existsSync(`${stem(relOk)}_response.json`), true, 'unflagged tx untouched');
+        assert.equal(fs.existsSync(`${stem(relOk)}_validation.json`), true);
+        assert.match(cap.errors.join('\n'), /reset: done 1 txs, 2 files/);
+
+        // No siblings present → counted as a tx with 0 files, no error.
+        cap = capture();
+        main({ DATA_DIR: root }, ['-q', 'approve', '-R'], cap.io);
+        assert.equal(cap.logs.length, 3);
+        assert.match(cap.errors.join('\n'), /reset: done 3 txs, 2 files/);
+        assert.equal(fs.existsSync(`${stem(relOk)}_response.json`), false);
+        assert.equal(fs.existsSync(`${stem(relNoResp)}_prompt.json`), true);
+        assert.equal(fs.existsSync(path.join(root, HASH.slice(0, 2))), true, 'no dir pruning with -R');
+    });
+
+    it('-s prints the sibling response and validation when present', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'query-'));
+        const rel = writePrompt(root, TX_A, 'Function: approve');
+        const abs = path.join(root, rel);
+        fs.writeFileSync(simPathForPrompt(abs), '{"status":"0x1"}');
+        fs.writeFileSync(responsePathForPrompt(abs), JSON.stringify({
+            responses: { simple: { model: 'deepseek-v4-pro', content: 'It approves.', finishReason: 'stop' } },
+        }));
+        fs.writeFileSync(validationPathForPrompt(abs), JSON.stringify({
+            checks: { simple: { deterministic: { verdict: 'pass', numbers: { ratio: 1, grounded: 1, total: 1, unmatched: [] } }, judge: null } },
+        }));
+
+        const { logs, errors, io } = capture();
+        main({ DATA_DIR: root, FORCE_COLOR: '0' }, ['-s'], io);
+        assert.equal(errors.length, 0);
+        const out = logs[0];
+        assert.ok(out.indexOf('## Simulation') < out.indexOf('## Response [simple] (deepseek-v4-pro)\nIt approves.'));
+        assert.ok(out.indexOf('## Response') < out.indexOf('## Validation [simple] ok\n- numbers: pass ratio=1 (1/1)'));
+
+        // Color: response light green, validation magenta.
+        logs.length = 0;
+        main({ DATA_DIR: root, FORCE_COLOR: '1' }, ['-s'], io);
+        assert.ok(logs[0].includes(`${RESPONSE_COLOR}It approves.${RESET}`));
+        assert.ok(logs[0].includes(`${VALIDATION_COLOR}## Validation [simple] ok${RESET}`));
+
+        // -d alone does not load the siblings.
+        logs.length = 0;
+        main({ DATA_DIR: root, FORCE_COLOR: '0' }, ['-d'], io);
+        assert.equal(logs[0].includes('## Response'), false);
+        assert.equal(logs[0].includes('## Validation'), false);
+    });
+
+    it('-v keeps only txs whose validation reports a problem', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'query-'));
+        const relOk = writePrompt(root, TX_A, 'Function: approve');
+        const relWarn = writePrompt(root, TX_B, 'Function: approve');
+        const relJudge = writePrompt(root, TX_C, 'Function: transfer');
+        writePrompt(root, '0x' + 'dd'.repeat(32), 'Function: approve'); // no validation at all
+        const write = (rel, checks) => fs.writeFileSync(validationPathForPrompt(path.join(root, rel)), JSON.stringify({ checks }));
+        write(relOk, { simple: { deterministic: { verdict: 'pass' }, judge: { verdict: 'good', score: 5 } } });
+        write(relWarn, { simple: { deterministic: { verdict: 'warn' }, judge: null } });
+        write(relJudge, { simple: { deterministic: { verdict: 'pass' }, judge: { verdict: 'wrong', score: 2 } } });
+
+        const { logs, io } = capture();
+        main({ DATA_DIR: root }, ['-v'], io);
+        assert.deepEqual(logs.sort(), [relWarn, relJudge].sort());
+
+        // -v combines with the other filters (AND).
+        logs.length = 0;
+        main({ DATA_DIR: root }, ['-v', '-q', 'transfer'], io);
+        assert.deepEqual(logs, [relJudge]);
+
+        // -S counts against the whole dataset.
+        logs.length = 0;
+        main({ DATA_DIR: root }, ['-v', '-S'], io);
+        assert.deepEqual(logs, ['2 / 4 (50.00%)']);
     });
 });

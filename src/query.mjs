@@ -28,7 +28,11 @@ Options:
   -o <n>              Skip the first n matches (after shuffle, before -l)
   -l <n>              Stop after n matches
   -d                  Print path and first userPrompt; color-code sections
-  -s                  Like -d, plus the sibling <txhash>_sim.json (light blue)
+  -s                  Like -d, plus the siblings when present: _sim.json
+                      (light blue), _response.json teacher answer (light
+                      green), _validation.json result (magenta)
+  -v                  Keep only txs whose _validation.json reports a problem
+                      (deterministic verdict != pass, or judge != good)
   -t <0|1>            Keep txs whose collector {txhash}.json has (.trace.call)
                       (1) or does not (0)
   -e <sections>       Keep files whose listed sections are resolved
@@ -38,7 +42,11 @@ Options:
                       (no path listing unless -d / -s / -x)
   -x                  Delete matching {txhash}.json files
   -X                  Like -x, plus _sim.json, _prompt.json, _prompt.nosrc,
-                      _sim.nosrc; prune empty parent dirs
+                      _sim.nosrc, _response.json, _validation.json; prune
+                      empty parent dirs
+  -R                  Delete only _response.json and _validation.json of the
+                      matching txs so gen-responses / validate-responses
+                      regenerate them (prompt, sim, trace stay); e.g. -v -R
   -h, --help          Show this help
 `;
 
@@ -78,6 +86,10 @@ export const SECTION_COLOR = {
 };
 
 export const SIM_COLOR = '\x1b[96m';
+/** Teacher response body in `-s` output. */
+export const RESPONSE_COLOR = '\x1b[92m';
+/** Validation summary in `-s` output. */
+export const VALIDATION_COLOR = '\x1b[95m';
 
 export const RESET = '\x1b[0m';
 
@@ -217,13 +229,13 @@ export function parseSectionList(val, flag) {
 
 /**
  * @param {string[]} argv
- * @return {{ q: Array<{ term: string, section?: string }>, c: string[], m: string[], e: string[], E: string[], min?: number, max?: number, limit?: number, offset?: number, random: boolean, details: boolean, sim: boolean, stats: boolean, hasCall?: boolean, deleteTrace: boolean, deleteSiblings: boolean, help: boolean }}
+ * @return {{ q: Array<{ term: string, section?: string }>, c: string[], m: string[], e: string[], E: string[], min?: number, max?: number, limit?: number, offset?: number, random: boolean, details: boolean, sim: boolean, validationProblems: boolean, stats: boolean, hasCall?: boolean, deleteTrace: boolean, deleteSiblings: boolean, deleteResponses: boolean, help: boolean }}
  */
 export function parseArgs(argv) {
     const filters = {
         q: [], c: [], m: [], e: [], E: [],
-        details: false, sim: false, random: false, stats: false,
-        deleteTrace: false, deleteSiblings: false, help: false,
+        details: false, sim: false, validationProblems: false, random: false, stats: false,
+        deleteTrace: false, deleteSiblings: false, deleteResponses: false, help: false,
     };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
@@ -238,6 +250,10 @@ export function parseArgs(argv) {
         if (a === '-s') {
             filters.details = true;
             filters.sim = true;
+            continue;
+        }
+        if (a === '-v') {
+            filters.validationProblems = true;
             continue;
         }
         if (a === '-r') {
@@ -255,6 +271,10 @@ export function parseArgs(argv) {
         if (a === '-X') {
             filters.deleteTrace = true;
             filters.deleteSiblings = true;
+            continue;
+        }
+        if (a === '-R') {
+            filters.deleteResponses = true;
             continue;
         }
         if (a === '-t') {
@@ -464,6 +484,100 @@ export function tracePathForPrompt(promptAbsPath) {
 }
 
 /**
+ * Teacher-response sibling (`_response.json`) of a `_prompt.json` path.
+ *
+ * @param {string} promptAbsPath
+ * @return {string}
+ */
+export function responsePathForPrompt(promptAbsPath) {
+    return promptAbsPath.replace(/_prompt\.json$/, '_response.json');
+}
+
+/**
+ * Validation sibling (`_validation.json`) of a `_prompt.json` path.
+ *
+ * @param {string} promptAbsPath
+ * @return {string}
+ */
+export function validationPathForPrompt(promptAbsPath) {
+    return promptAbsPath.replace(/_prompt\.json$/, '_validation.json');
+}
+
+/**
+ * Parse a sibling JSON file. Returns `null` when it is missing (ENOENT is
+ * silent) or unreadable (reported through `onWarn`).
+ *
+ * @param {string} absPath
+ * @param {(msg: string) => void} [onWarn]
+ * @return {object | null}
+ */
+function readSiblingJson(absPath, onWarn) {
+    let raw;
+    try {
+        raw = fs.readFileSync(absPath, 'utf8');
+    } catch (e) {
+        if (e && e.code !== 'ENOENT') onWarn?.(`warn: skip ${absPath}: ${e.message}`);
+        return null;
+    }
+    try {
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (e) {
+        onWarn?.(`warn: skip ${absPath}: ${e.message}`);
+        return null;
+    }
+}
+
+/**
+ * Parsed sibling `_response.json`, or `null` when missing/invalid.
+ *
+ * @param {string} promptAbsPath
+ * @param {(msg: string) => void} [onWarn]
+ * @return {object | null}
+ */
+export function readResponse(promptAbsPath, onWarn) {
+    const parsed = readSiblingJson(responsePathForPrompt(promptAbsPath), onWarn);
+    if (!parsed || !parsed.responses || typeof parsed.responses !== 'object') return null;
+    return parsed;
+}
+
+/**
+ * Parsed sibling `_validation.json`, or `null` when missing/invalid.
+ *
+ * @param {string} promptAbsPath
+ * @param {(msg: string) => void} [onWarn]
+ * @return {object | null}
+ */
+export function readValidation(promptAbsPath, onWarn) {
+    const parsed = readSiblingJson(validationPathForPrompt(promptAbsPath), onWarn);
+    if (!parsed || !parsed.checks || typeof parsed.checks !== 'object') return null;
+    return parsed;
+}
+
+/**
+ * True when at least one style check reports a problem: the deterministic
+ * verdict is not `pass`, or a judge ran and did not return `good`.
+ * A missing validation file has no known problems (returns `false`).
+ *
+ * @param {object | null} validation  Parsed `_validation.json`
+ * @param {string[]} [styles]  Restrict to these styles (default: all)
+ * @return {boolean}
+ */
+export function hasValidationProblems(validation, styles) {
+    if (!validation || !validation.checks || typeof validation.checks !== 'object') return false;
+    const wanted = styles && styles.length ? new Set(styles) : null;
+    for (const [style, check] of Object.entries(validation.checks)) {
+        if (wanted && !wanted.has(style)) continue;
+        if (!check || typeof check !== 'object') continue;
+        const det = check.deterministic;
+        if (det && det.verdict && det.verdict !== 'pass') return true;
+        const judge = check.judge;
+        if (judge && typeof judge === 'object' && judge.verdict && judge.verdict !== 'good') return true;
+    }
+    return false;
+}
+
+/**
  * True when the collector trace has a `.trace.call` property that is not null.
  *
  * @param {unknown} parsed
@@ -535,10 +649,35 @@ export function unlinkTxFiles(traceAbsPath, siblings) {
             `${stem}_prompt.json`,
             `${stem}_prompt.nosrc`,
             `${stem}_sim.nosrc`,
+            `${stem}_response.json`,
+            `${stem}_validation.json`,
         );
     }
     const removed = [];
     for (const p of names) {
+        try {
+            fs.unlinkSync(p);
+            removed.push(p);
+        } catch (e) {
+            if (e.code !== 'ENOENT') throw e;
+        }
+    }
+    return removed;
+}
+
+/**
+ * Unlink only the teacher-response siblings (`_response.json`,
+ * `_validation.json`) of a tx so the next `gen-responses` /
+ * `validate-responses` run regenerates them. Prompt, sim, and trace stay.
+ * Missing files are ignored.
+ *
+ * @param {string} traceAbsPath  Collector trace path (or the derived one from `tracePathForPrompt`)
+ * @return {string[]} paths actually removed
+ */
+export function unlinkResponseFiles(traceAbsPath) {
+    const stem = traceAbsPath.replace(/\.json$/, '');
+    const removed = [];
+    for (const p of [`${stem}_response.json`, `${stem}_validation.json`]) {
         try {
             fs.unlinkSync(p);
             removed.push(p);
@@ -602,20 +741,115 @@ export function loadSimText(promptAbsPath, onWarn) {
 }
 
 /**
+ * Teacher responses from the sibling `_response.json`, one block per style,
+ * or `null` when the file is missing/invalid or has no text content.
+ *
+ * @param {string} promptAbsPath
+ * @param {(msg: string) => void} [onWarn]
+ * @return {string | null}
+ */
+export function loadResponseText(promptAbsPath, onWarn) {
+    const parsed = readResponse(promptAbsPath, onWarn);
+    if (!parsed) return null;
+    return formatResponse(parsed);
+}
+
+/**
+ * Render a parsed `_response.json` for `-s` output.
+ *
+ * @param {{ responses?: Record<string, { model?: string, content?: string, finishReason?: string }> }} response
+ * @return {string | null}
+ */
+export function formatResponse(response) {
+    const entries = Object.entries(response?.responses || {})
+        .filter(([, e]) => e && typeof e.content === 'string');
+    if (!entries.length) return null;
+    return entries.map(([style, e]) => {
+        const meta = [];
+        if (e.model) meta.push(e.model);
+        if (e.finishReason && e.finishReason !== 'stop') meta.push(`finish=${e.finishReason}`);
+        const head = `## Response [${style}]${meta.length ? ` (${meta.join(', ')})` : ''}`;
+        return `${head}\n${e.content.replace(/\n+$/, '')}`;
+    }).join('\n');
+}
+
+/**
+ * Validation summary from the sibling `_validation.json`, or `null` when
+ * missing/invalid.
+ *
+ * @param {string} promptAbsPath
+ * @param {(msg: string) => void} [onWarn]
+ * @return {string | null}
+ */
+export function loadValidationText(promptAbsPath, onWarn) {
+    const parsed = readValidation(promptAbsPath, onWarn);
+    if (!parsed) return null;
+    return formatValidation(parsed);
+}
+
+/**
+ * Render a parsed `_validation.json` for `-s` output: one line for the
+ * deterministic number check and, if present, the judge verdict with its
+ * issues.
+ *
+ * @param {object} validation
+ * @return {string | null}
+ */
+export function formatValidation(validation) {
+    const entries = Object.entries(validation?.checks || {}).filter(([, c]) => c && typeof c === 'object');
+    if (!entries.length) return null;
+    const lines = [];
+    for (const [style, check] of entries) {
+        const flag = hasValidationProblems({ checks: { [style]: check } }) ? 'PROBLEM' : 'ok';
+        lines.push(`## Validation [${style}] ${flag}`);
+        const det = check.deterministic;
+        if (det && det.numbers) {
+            const n = det.numbers;
+            lines.push(`- numbers: ${det.verdict} ratio=${n.ratio} (${n.grounded}/${n.total})`);
+            if (Array.isArray(n.unmatched) && n.unmatched.length) {
+                lines.push(`  unmatched: ${n.unmatched.join(', ')}`);
+            }
+        } else if (det && det.verdict) {
+            lines.push(`- numbers: ${det.verdict}`);
+        }
+        const judge = check.judge;
+        if (judge && typeof judge === 'object') {
+            const score = judge.score === null || judge.score === undefined ? '-' : judge.score;
+            lines.push(`- judge: ${judge.verdict || 'n/a'} score=${score}${judge.model ? ` (${judge.model})` : ''}`);
+            if (judge.error) lines.push(`  error: ${judge.error}`);
+            for (const issue of Array.isArray(judge.issues) ? judge.issues : []) {
+                const quote = issue.quote ? ` "${issue.quote}"` : '';
+                lines.push(`  * ${issue.type || 'other'}:${quote}${issue.explanation ? ` — ${issue.explanation}` : ''}`);
+            }
+        } else if (check.sampled) {
+            lines.push('- judge: sampled, not run yet');
+        }
+    }
+    return lines.join('\n');
+}
+
+/**
  * @param {string} relPath
  * @param {string} userPrompt
  * @param {boolean} details
  * @param {boolean} [color]
  * @param {string | null} [simText]
+ * @param {{ responseText?: string | null, validationText?: string | null }} [extra]
  * @return {string}
  */
-export function formatMatch(relPath, userPrompt, details, color = false, simText = null) {
+export function formatMatch(relPath, userPrompt, details, color = false, simText = null, extra = {}) {
     if (!details || typeof userPrompt !== 'string') return relPath;
     const body = color ? colorizePrompt(userPrompt) : userPrompt;
     let out = `=== ${relPath} ===\n${body}`;
     if (simText != null) {
         const simBody = `## Simulation\n${simText}`;
         out += `\n${color ? colorizeLines(simBody, SIM_COLOR) : simBody}`;
+    }
+    if (extra.responseText != null) {
+        out += `\n${color ? colorizeLines(extra.responseText, RESPONSE_COLOR) : extra.responseText}`;
+    }
+    if (extra.validationText != null) {
+        out += `\n${color ? colorizeLines(extra.validationText, VALIDATION_COLOR) : extra.validationText}`;
     }
     return out;
 }
@@ -713,6 +947,13 @@ function forEachMatching(root, filters, onHit, onWarn) {
                 if (hasTraceCall(parsed) !== wantCall) continue;
             }
 
+            if (filters.validationProblems) {
+                // Sibling of the prompt; txs without a prompt cannot have one.
+                if (!promptAbs) continue;
+                const validation = readValidation(promptAbs, onWarn);
+                if (!hasValidationProblems(validation)) continue;
+            }
+
             let userPrompt = null;
             if (requirePrompt) {
                 if (!promptAbs) continue;
@@ -758,7 +999,7 @@ export function visitMatchingPrompts(root, filters, onMatch, onWarn) {
     const limit = filters.limit;
     const offset = filters.offset || 0;
     const rng = filters.rng || Math.random;
-    const emitHits = !filters.stats || filters.details || filters.sim || filters.deleteTrace;
+    const emitHits = !filters.stats || filters.details || filters.sim || filters.deleteTrace || filters.deleteResponses;
     if (limit === 0 && !filters.stats) return { scanned: 0, matched: 0 };
 
     if (filters.random || filters.stats) {
@@ -827,17 +1068,33 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
 
     const color = (filters.details || filters.sim) && shouldUseColor(process.stdout, env);
     const progressEvery = parseInt(env.PROGRESS_EVERY || '100', 10) || 100;
-    const emitHits = !filters.stats || filters.details || filters.sim || filters.deleteTrace;
+    const emitHits = !filters.stats || filters.details || filters.sim || filters.deleteTrace || filters.deleteResponses;
     let deletedTxs = 0;
     let deletedFiles = 0;
     let deletedDirs = 0;
+    let resetTxs = 0;
+    let resetFiles = 0;
     const counts = visitMatchingPrompts(
         dataDir,
         filters,
         ({ relPath, absPath, traceAbsPath, userPrompt }) => {
             if (emitHits) {
-                const simText = filters.sim ? loadSimText(absPath, (msg) => io.error(msg)) : null;
-                io.log(formatMatch(relPath, userPrompt, filters.details, color, simText));
+                const warn = (msg) => io.error(msg);
+                const simText = filters.sim ? loadSimText(absPath, warn) : null;
+                const extra = filters.sim
+                    ? { responseText: loadResponseText(absPath, warn), validationText: loadValidationText(absPath, warn) }
+                    : {};
+                io.log(formatMatch(relPath, userPrompt, filters.details, color, simText, extra));
+            }
+            // -R: reset teacher output only. Skipped when -X already removes
+            // the whole tx; combined with -x it removes trace + responses.
+            if (filters.deleteResponses && !filters.deleteSiblings && traceAbsPath) {
+                const removed = unlinkResponseFiles(traceAbsPath);
+                resetFiles += removed.length;
+                resetTxs++;
+                if (resetTxs % progressEvery === 0) {
+                    io.error(`reset: ${resetTxs} txs (${resetFiles} files)`);
+                }
             }
             if (!filters.deleteTrace || !traceAbsPath) return;
             const removed = unlinkTxFiles(traceAbsPath, filters.deleteSiblings);
@@ -853,6 +1110,9 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
     );
     if (filters.stats) {
         io.log(formatStats(counts.matched, counts.scanned));
+    }
+    if (filters.deleteResponses && !filters.deleteSiblings) {
+        io.error(`reset: done ${resetTxs} txs, ${resetFiles} files`);
     }
     if (filters.deleteTrace) {
         io.error(`delete: done ${deletedTxs} txs, ${deletedFiles} files, ${deletedDirs} dirs`);

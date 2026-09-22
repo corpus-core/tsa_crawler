@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { walkBuckets } from './bucket_paths.mjs';
-import { PROMPT_FILE_RE } from './query.mjs';
+import { PROMPT_FILE_RE, readValidation } from './query.mjs';
 import {
     DEFAULT_STYLES,
     promptSha256,
@@ -40,6 +40,11 @@ export const SKIP_REASONS = Object.freeze({
     EMPTY_CONTENT: 'empty-content',
     BAD_PROMPT: 'bad-prompt',
     UNREADABLE: 'unreadable',
+    NO_VALIDATION: 'no-validation',
+    STALE_VALIDATION: 'stale-validation',
+    LOW_GROUNDING: 'low-grounding',
+    LOW_JUDGE: 'low-judge',
+    JUDGE_NOT_GOOD: 'judge-not-good',
 });
 
 export const HELP = `Usage: DATA_DIR=<dir> OUT=<dir> node src/export_dataset.mjs [options]
@@ -48,6 +53,10 @@ Pair every _prompt.json under DATA_DIR with the matching sibling
 _response.json and emit an SFT dataset (${TRAIN_NAME} + ${VAL_NAME}).
 Rows whose promptSha256 does not match the current prompt, whose
 finish_reason is not "stop", or whose content is empty are skipped.
+
+Optional quality gates read the sibling _validation.json written by
+validate_responses. All gates are off by default; a stale validation
+(contentSha256 mismatch) is treated as missing.
 
 Options:
   --out <dir>     Output root (overrides OUT)
@@ -61,6 +70,13 @@ Env:
   VAL_RATIO             Fraction of codehashes for val.jsonl (default ${DEFAULT_VAL_RATIO})
   SEED                  Split salt (default ${DEFAULT_SEED})
   TEACHER_SYSTEM_SUFFIX Same suffix used at generation time (default empty)
+  REQUIRE_VALIDATION    1 = skip rows without a fresh validation check (no-validation)
+  MIN_GROUNDING_RATIO   Skip rows whose number-grounding ratio is below this
+                        (0..1; default 0 = off) -> low-grounding
+  MIN_JUDGE_SCORE       Skip rows whose judge score is below this (1..5;
+                        default 0 = off; rows without a judge pass) -> low-judge
+  REQUIRE_JUDGE_PASS    1 = keep only rows whose judge verdict is "good"
+                        (rows without a judge are skipped) -> judge-not-good
   PROGRESS_EVERY        Log every N processed prompts (default 500; 0=off)
 `;
 
@@ -89,7 +105,7 @@ export function parseArgs(argv) {
 
 /**
  * @param {NodeJS.ProcessEnv} env
- * @return {{ styles: string[], valRatio: number, seed: string, teacherSystemSuffix: string, progressEvery: number }}
+ * @return {{ styles: string[], valRatio: number, seed: string, teacherSystemSuffix: string, progressEvery: number, requireValidation: boolean, minGroundingRatio: number, minJudgeScore: number, requireJudgePass: boolean }}
  */
 export function resolveConfig(env = process.env) {
     return {
@@ -100,7 +116,66 @@ export function resolveConfig(env = process.env) {
         progressEvery: env.PROGRESS_EVERY === undefined || env.PROGRESS_EVERY === ''
             ? 500
             : parseNonNegInt(env.PROGRESS_EVERY, 500, 'PROGRESS_EVERY'),
+        requireValidation: env.REQUIRE_VALIDATION === '1',
+        minGroundingRatio: parseUnitRange(env.MIN_GROUNDING_RATIO, 0, 1, 'MIN_GROUNDING_RATIO'),
+        minJudgeScore: parseUnitRange(env.MIN_JUDGE_SCORE, 0, 5, 'MIN_JUDGE_SCORE'),
+        requireJudgePass: env.REQUIRE_JUDGE_PASS === '1',
     };
+}
+
+function parseUnitRange(raw, lo, hi, name) {
+    if (raw === undefined || raw === '') return 0;
+    const v = Number(raw);
+    if (!Number.isFinite(v) || v < lo || v > hi) {
+        throw new Error(`${name} must be a number in [${lo}, ${hi}] (got ${raw})`);
+    }
+    return v;
+}
+
+/**
+ * Apply the validation gates to one (prompt × style) pair. Returns a
+ * `SKIP_REASONS` value or `null` when the row passes.
+ *
+ * A check whose `contentSha256` does not match the response content is
+ * stale and treated as missing. Judge gates only bite when a judge result
+ * exists, except `requireJudgePass`, which also rejects unjudged rows.
+ *
+ * @param {object | null} check  `validation.checks[style]` or null
+ * @param {string} contentSha  SHA-256 of the response content
+ * @param {{ requireValidation: boolean, minGroundingRatio: number, minJudgeScore: number, requireJudgePass: boolean }} cfg
+ * @return {string | null}
+ */
+export function validationGate(check, contentSha, cfg) {
+    const anyGate = cfg.requireValidation || cfg.minGroundingRatio > 0 || cfg.minJudgeScore > 0 || cfg.requireJudgePass;
+    if (!anyGate) return null;
+    if (!check || typeof check !== 'object') {
+        if (cfg.requireValidation || cfg.requireJudgePass) return SKIP_REASONS.NO_VALIDATION;
+        return null;
+    }
+    if (check.contentSha256 && check.contentSha256 !== contentSha) {
+        if (cfg.requireValidation || cfg.requireJudgePass) return SKIP_REASONS.STALE_VALIDATION;
+        return null;
+    }
+    const ratio = check.deterministic?.numbers?.ratio;
+    if (cfg.minGroundingRatio > 0 && typeof ratio === 'number' && ratio < cfg.minGroundingRatio) {
+        return SKIP_REASONS.LOW_GROUNDING;
+    }
+    const judge = check.judge && typeof check.judge === 'object' ? check.judge : null;
+    if (cfg.requireJudgePass && (!judge || judge.verdict !== 'good')) {
+        return SKIP_REASONS.JUDGE_NOT_GOOD;
+    }
+    if (cfg.minJudgeScore > 0 && judge && typeof judge.score === 'number' && judge.score < cfg.minJudgeScore) {
+        return SKIP_REASONS.LOW_JUDGE;
+    }
+    return null;
+}
+
+/**
+ * @param {string} text
+ * @return {string}
+ */
+function sha256Hex(text) {
+    return crypto.createHash('sha256').update(text ?? '').digest('hex');
 }
 
 function parseStyles(raw) {
@@ -166,11 +241,12 @@ export function isValCodehash(codehash, valRatio, seed) {
  * @param {{ txHash: string, codehash: string, methodId: string, style: string, systemPrompt: string, userPrompt: string, relPath: string }} job
  * @param {{ model?: string, content: string, usage?: object }} entry
  * @param {string} systemPromptForModel  The system prompt actually sent to the teacher (with suffix).
+ * @param {object | null} [check]  Fresh `validation.checks[style]`, if any
  * @return {object}
  */
-export function buildDatasetRow(job, entry, systemPromptForModel) {
+export function buildDatasetRow(job, entry, systemPromptForModel, check = null) {
     const usage = entry.usage || {};
-    return {
+    const row = {
         messages: [
             { role: 'system', content: systemPromptForModel },
             { role: 'user', content: job.userPrompt },
@@ -187,6 +263,17 @@ export function buildDatasetRow(job, entry, systemPromptForModel) {
             rel_path: job.relPath,
         },
     };
+    if (check && typeof check === 'object') {
+        const det = check.deterministic || {};
+        const judge = check.judge && typeof check.judge === 'object' ? check.judge : null;
+        row.meta.validation = {
+            grounding_ratio: typeof det.numbers?.ratio === 'number' ? det.numbers.ratio : null,
+            grounding_verdict: det.verdict || null,
+            judge_score: judge && typeof judge.score === 'number' ? judge.score : null,
+            judge_verdict: judge ? judge.verdict || null : null,
+        };
+    }
+    return row;
 }
 
 function numOr0(v) {
@@ -202,10 +289,16 @@ function numOr0(v) {
  * @param {(row: object, split: 'train' | 'val') => void} onRow
  * @param {(reason: string, relPath: string, style: string) => void} [onSkip]
  * @param {(msg: string) => void} [onProgress]
- * @return {{ scanned: number, kept: { train: number, val: number }, skipped: Record<string, number>, promptLengths: number[], answerLengths: number[], tokens: { prompt: number, completion: number }, models: Record<string, number>, codehashes: { train: Set<string>, val: Set<string> } }}
+ * @return {{ scanned: number, kept: { train: number, val: number }, skipped: Record<string, number>, promptLengths: number[], answerLengths: number[], tokens: { prompt: number, completion: number }, models: Record<string, number>, codehashes: { train: Set<string>, val: Set<string> }, validation: { validated: number, judged: number, ratios: number[], judgeScores: Record<string, number> } }}
  */
 export function processAll(root, cfg, onRow, onSkip, onProgress) {
     const wanted = new Set(cfg.styles);
+    const gateCfg = {
+        requireValidation: !!cfg.requireValidation,
+        minGroundingRatio: cfg.minGroundingRatio || 0,
+        minJudgeScore: cfg.minJudgeScore || 0,
+        requireJudgePass: !!cfg.requireJudgePass,
+    };
     const stats = {
         scanned: 0,
         kept: { train: 0, val: 0 },
@@ -215,6 +308,7 @@ export function processAll(root, cfg, onRow, onSkip, onProgress) {
         tokens: { prompt: 0, completion: 0 },
         models: {},
         codehashes: { train: new Set(), val: new Set() },
+        validation: { validated: 0, judged: 0, ratios: [], judgeScores: {} },
     };
     const progressEvery = cfg.progressEvery || 0;
     const recordSkip = (reason, relPath, style) => {
@@ -255,6 +349,7 @@ export function processAll(root, cfg, onRow, onSkip, onProgress) {
                 }
             }
             const responseFile = readExistingResponse(absPath);
+            const validationFile = responseFile ? readValidation(absPath) : null;
             for (const style of cfg.styles) {
                 const promptEntry = byStyle.get(style);
                 if (!promptEntry) { recordSkip(SKIP_REASONS.BAD_PROMPT, relPath, style); continue; }
@@ -270,6 +365,12 @@ export function processAll(root, cfg, onRow, onSkip, onProgress) {
                 if (typeof entry.content !== 'string' || !entry.content.trim()) {
                     recordSkip(SKIP_REASONS.EMPTY_CONTENT, relPath, style); continue;
                 }
+                const contentSha = sha256Hex(entry.content);
+                const rawCheck = validationFile?.checks?.[style];
+                const check = rawCheck && typeof rawCheck === 'object' ? rawCheck : null;
+                const gateReason = validationGate(check, contentSha, gateCfg);
+                if (gateReason) { recordSkip(gateReason, relPath, style); continue; }
+                const freshCheck = check && (!check.contentSha256 || check.contentSha256 === contentSha) ? check : null;
                 const row = buildDatasetRow({
                     txHash: tx[1],
                     codehash,
@@ -278,9 +379,20 @@ export function processAll(root, cfg, onRow, onSkip, onProgress) {
                     systemPrompt: promptEntry.systemPrompt,
                     userPrompt: promptEntry.userPrompt,
                     relPath,
-                }, entry, system);
+                }, entry, system, freshCheck);
                 onRow(row, split);
                 stats.kept[split]++;
+                if (freshCheck) {
+                    stats.validation.validated++;
+                    const ratio = freshCheck.deterministic?.numbers?.ratio;
+                    if (typeof ratio === 'number') stats.validation.ratios.push(ratio);
+                    const judge = freshCheck.judge;
+                    if (judge && typeof judge === 'object') {
+                        stats.validation.judged++;
+                        const bucket = typeof judge.score === 'number' ? String(judge.score) : 'unparseable';
+                        stats.validation.judgeScores[bucket] = (stats.validation.judgeScores[bucket] || 0) + 1;
+                    }
+                }
                 stats.codehashes[split].add(codehash);
                 stats.promptLengths.push(promptEntry.userPrompt.length);
                 stats.answerLengths.push(entry.content.length);
@@ -310,12 +422,13 @@ export function percentile(arr, p) {
 
 /**
  * @param {ReturnType<typeof processAll>} stats
- * @param {{ styles: string[], valRatio: number, seed: string }} cfg
+ * @param {{ styles: string[], valRatio: number, seed: string, requireValidation?: boolean, minGroundingRatio?: number, minJudgeScore?: number, requireJudgePass?: boolean }} cfg
  * @return {object}
  */
 export function buildManifest(stats, cfg) {
+    const v = stats.validation || { validated: 0, judged: 0, ratios: [], judgeScores: {} };
     return {
-        version: 1,
+        version: 2,
         createdAt: new Date().toISOString(),
         styles: cfg.styles,
         seed: cfg.seed,
@@ -326,6 +439,22 @@ export function buildManifest(stats, cfg) {
         skipped: stats.skipped,
         tokens: stats.tokens,
         models: stats.models,
+        validation: {
+            gates: {
+                requireValidation: !!cfg.requireValidation,
+                minGroundingRatio: cfg.minGroundingRatio || 0,
+                minJudgeScore: cfg.minJudgeScore || 0,
+                requireJudgePass: !!cfg.requireJudgePass,
+            },
+            rowsValidated: v.validated,
+            rowsJudged: v.judged,
+            groundingRatio: {
+                mean: v.ratios.length ? Number((v.ratios.reduce((a, b) => a + b, 0) / v.ratios.length).toFixed(4)) : null,
+                p10: v.ratios.length ? percentile(v.ratios, 0.1) : null,
+                p50: v.ratios.length ? percentile(v.ratios, 0.5) : null,
+            },
+            judgeScores: v.judgeScores,
+        },
         lengths: {
             user_chars: {
                 min: stats.promptLengths.length ? Math.min(...stats.promptLengths) : 0,
@@ -369,6 +498,24 @@ export function formatSummary(manifest) {
     if (modelEntries.length) {
         lines.push('  models:');
         for (const [m, n] of modelEntries) lines.push(`    ${m}: ${n}`);
+    }
+    const v = manifest.validation;
+    if (v) {
+        const g = v.gates || {};
+        const active = [
+            g.requireValidation ? 'REQUIRE_VALIDATION' : null,
+            g.minGroundingRatio ? `MIN_GROUNDING_RATIO=${g.minGroundingRatio}` : null,
+            g.minJudgeScore ? `MIN_JUDGE_SCORE=${g.minJudgeScore}` : null,
+            g.requireJudgePass ? 'REQUIRE_JUDGE_PASS' : null,
+        ].filter(Boolean);
+        lines.push(`  validation:     rows=${v.rowsValidated} judged=${v.rowsJudged} gates=${active.length ? active.join(',') : 'none'}`);
+        if (v.groundingRatio && v.groundingRatio.mean !== null) {
+            lines.push(`  grounding:      mean=${v.groundingRatio.mean} p10=${v.groundingRatio.p10} p50=${v.groundingRatio.p50}`);
+        }
+        const scores = Object.entries(v.judgeScores || {}).sort();
+        if (scores.length) {
+            lines.push(`  judge scores:   ${scores.map(([k, n]) => `${k}=${n}`).join(' ')}`);
+        }
     }
     return lines.join('\n');
 }
@@ -418,7 +565,13 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
         io.error(e.message); process.exitCode = 1; return;
     }
 
-    io.log(`export-dataset: scanning ${dataDir} styles=${cfg.styles.join(',')} valRatio=${cfg.valRatio} seed=${cfg.seed}${flags.dryRun ? ' dry-run' : ''}`);
+    const gates = [
+        cfg.requireValidation ? 'REQUIRE_VALIDATION' : null,
+        cfg.minGroundingRatio ? `MIN_GROUNDING_RATIO=${cfg.minGroundingRatio}` : null,
+        cfg.minJudgeScore ? `MIN_JUDGE_SCORE=${cfg.minJudgeScore}` : null,
+        cfg.requireJudgePass ? 'REQUIRE_JUDGE_PASS' : null,
+    ].filter(Boolean);
+    io.log(`export-dataset: scanning ${dataDir} styles=${cfg.styles.join(',')} valRatio=${cfg.valRatio} seed=${cfg.seed} gates=${gates.length ? gates.join(',') : 'none'}${flags.dryRun ? ' dry-run' : ''}`);
 
     // Collect rows into memory; even 26k JSON rows are trivial. Bail early
     // if that ever changes (streaming would need a different manifest strategy).

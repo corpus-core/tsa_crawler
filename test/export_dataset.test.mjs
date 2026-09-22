@@ -1,5 +1,6 @@
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,6 +14,7 @@ import {
     percentile,
     buildManifest,
     formatSummary,
+    validationGate,
     main,
     SKIP_REASONS,
     TRAIN_NAME,
@@ -28,6 +30,7 @@ import {
     writeResponseEntry,
     RESPONSE_VERSION,
 } from '../src/gen_responses.mjs';
+import { writeValidationEntry } from '../src/validate_responses.mjs';
 
 const METHOD = 'a9059cbb';
 const TX_A = '0x' + 'aa'.repeat(32);
@@ -231,14 +234,169 @@ describe('buildDatasetRow / percentile / manifest', () => {
             answerLengths: [5, 15, 25],
         };
         const manifest = buildManifest(stats, { styles: ['simple'], valRatio: 0.1, seed: 'x' });
-        assert.equal(manifest.version, 1);
+        assert.equal(manifest.version, 2);
         assert.equal(manifest.kept.train, 2);
         assert.equal(manifest.codehashes.train, 1);
         assert.equal(manifest.lengths.user_chars.p50, 20);
         assert.equal(manifest.lengths.assistant_chars.max, 25);
+        // No validation stats supplied → neutral block, gates all off.
+        assert.deepEqual(manifest.validation.gates, {
+            requireValidation: false, minGroundingRatio: 0, minJudgeScore: 0, requireJudgePass: false,
+        });
+        assert.equal(manifest.validation.rowsValidated, 0);
+        assert.equal(manifest.validation.groundingRatio.mean, null);
         const summary = formatSummary(manifest);
         assert.match(summary, /train rows:\s+2/);
         assert.match(summary, /stale-hash: 1/);
+        assert.match(summary, /gates=none/);
+    });
+
+    it('buildManifest reports validation stats and active gates', () => {
+        const stats = {
+            scanned: 2, kept: { train: 2, val: 0 },
+            codehashes: { train: new Set(['a']), val: new Set() },
+            skipped: {}, tokens: { prompt: 0, completion: 0 }, models: {},
+            promptLengths: [1, 2], answerLengths: [1, 2],
+            validation: { validated: 2, judged: 1, ratios: [0.5, 1], judgeScores: { 4: 1 } },
+        };
+        const manifest = buildManifest(stats, {
+            styles: ['simple'], valRatio: 0, seed: 'x',
+            minGroundingRatio: 0.7, requireJudgePass: true,
+        });
+        assert.equal(manifest.validation.rowsValidated, 2);
+        assert.equal(manifest.validation.rowsJudged, 1);
+        assert.equal(manifest.validation.groundingRatio.mean, 0.75);
+        assert.deepEqual(manifest.validation.judgeScores, { 4: 1 });
+        const summary = formatSummary(manifest);
+        assert.match(summary, /gates=MIN_GROUNDING_RATIO=0\.7,REQUIRE_JUDGE_PASS/);
+        assert.match(summary, /judge scores:\s+4=1/);
+    });
+
+    it('row meta carries validation fields when a fresh check is given', () => {
+        const check = {
+            deterministic: { verdict: 'warn', numbers: { ratio: 0.75 } },
+            judge: { score: 3, verdict: 'flawed' },
+        };
+        const row = buildDatasetRow(
+            { txHash: TX_A, codehash: HASH_A, methodId: METHOD, style: 'simple', userPrompt: 'u', systemPrompt: 's', relPath: 'p' },
+            { content: 'C' }, 's', check,
+        );
+        assert.deepEqual(row.meta.validation, {
+            grounding_ratio: 0.75, grounding_verdict: 'warn', judge_score: 3, judge_verdict: 'flawed',
+        });
+        const bare = buildDatasetRow(
+            { txHash: TX_A, codehash: HASH_A, methodId: METHOD, style: 'simple', userPrompt: 'u', systemPrompt: 's', relPath: 'p' },
+            { content: 'C' }, 's',
+        );
+        assert.equal('validation' in bare.meta, false);
+    });
+});
+
+describe('validationGate', () => {
+    const off = { requireValidation: false, minGroundingRatio: 0, minJudgeScore: 0, requireJudgePass: false };
+    const check = (ratio, judge) => ({
+        contentSha256: 'sha',
+        deterministic: { verdict: 'pass', numbers: { ratio } },
+        judge: judge || null,
+    });
+
+    it('is a no-op when every gate is off', () => {
+        assert.equal(validationGate(null, 'sha', off), null);
+        assert.equal(validationGate(check(0.1, { score: 1, verdict: 'wrong' }), 'sha', off), null);
+    });
+
+    it('REQUIRE_VALIDATION skips missing and stale checks', () => {
+        const cfg = { ...off, requireValidation: true };
+        assert.equal(validationGate(null, 'sha', cfg), SKIP_REASONS.NO_VALIDATION);
+        assert.equal(validationGate(check(1), 'other', cfg), SKIP_REASONS.STALE_VALIDATION);
+        assert.equal(validationGate(check(1), 'sha', cfg), null);
+    });
+
+    it('MIN_GROUNDING_RATIO only bites when a fresh check exists', () => {
+        const cfg = { ...off, minGroundingRatio: 0.8 };
+        assert.equal(validationGate(null, 'sha', cfg), null, 'missing → pass without REQUIRE_VALIDATION');
+        assert.equal(validationGate(check(0.5), 'other', cfg), null, 'stale → treated as missing');
+        assert.equal(validationGate(check(0.5), 'sha', cfg), SKIP_REASONS.LOW_GROUNDING);
+        assert.equal(validationGate(check(0.8), 'sha', cfg), null, 'boundary is inclusive');
+    });
+
+    it('MIN_JUDGE_SCORE ignores unjudged rows; REQUIRE_JUDGE_PASS does not', () => {
+        const min = { ...off, minJudgeScore: 4 };
+        assert.equal(validationGate(check(1), 'sha', min), null);
+        assert.equal(validationGate(check(1, { score: 3, verdict: 'flawed' }), 'sha', min), SKIP_REASONS.LOW_JUDGE);
+        assert.equal(validationGate(check(1, { score: 4, verdict: 'good' }), 'sha', min), null);
+        assert.equal(validationGate(check(1, { score: null, verdict: 'unparseable' }), 'sha', min), null, 'unparseable has no score');
+
+        const pass = { ...off, requireJudgePass: true };
+        assert.equal(validationGate(null, 'sha', pass), SKIP_REASONS.NO_VALIDATION);
+        assert.equal(validationGate(check(1), 'sha', pass), SKIP_REASONS.JUDGE_NOT_GOOD);
+        assert.equal(validationGate(check(1, { score: 3, verdict: 'flawed' }), 'sha', pass), SKIP_REASONS.JUDGE_NOT_GOOD);
+        assert.equal(validationGate(check(1, { score: 5, verdict: 'good' }), 'sha', pass), null);
+    });
+
+    it('processAll applies gates end-to-end and records skip reasons', () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'exp-'));
+        try {
+            const pGood = writePrompt(root, TX_A, HASH_A);
+            const pLow = writePrompt(root, TX_B, HASH_B);
+            const pNoVal = writePrompt(root, TX_C, HASH_C);
+            writeResponse(pGood, 'simple', { content: 'good answer' });
+            writeResponse(pLow, 'simple', { content: 'low answer' });
+            writeResponse(pNoVal, 'simple', { content: 'unchecked' });
+            const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
+            writeValidationEntry(pGood, { txHash: TX_A, codehash: HASH_A, methodId: METHOD }, 'simple', {
+                contentSha256: sha('good answer'),
+                deterministic: { verdict: 'pass', numbers: { ratio: 1 } },
+                judge: { score: 5, verdict: 'good' },
+            });
+            writeValidationEntry(pLow, { txHash: TX_B, codehash: HASH_B, methodId: METHOD }, 'simple', {
+                contentSha256: sha('low answer'),
+                deterministic: { verdict: 'fail', numbers: { ratio: 0.2 } },
+                judge: null,
+            });
+
+            const base = { styles: ['simple'], valRatio: 0, seed: '1', teacherSystemSuffix: '' };
+            let rows = [];
+            let stats = processAll(root, { ...base, minGroundingRatio: 0.7 }, (r) => rows.push(r));
+            assert.equal(rows.length, 2, 'good + unchecked pass; low skipped');
+            assert.equal(stats.skipped[SKIP_REASONS.LOW_GROUNDING], 1);
+            assert.equal(stats.validation.validated, 1);
+            assert.equal(stats.validation.judged, 1);
+            assert.deepEqual(stats.validation.judgeScores, { 5: 1 });
+            const goodRow = rows.find((r) => r.meta.tx === TX_A);
+            assert.equal(goodRow.meta.validation.judge_score, 5);
+            assert.equal('validation' in rows.find((r) => r.meta.tx === TX_C).meta, false);
+
+            rows = [];
+            stats = processAll(root, { ...base, requireValidation: true, minGroundingRatio: 0.7 }, (r) => rows.push(r));
+            assert.equal(rows.length, 1);
+            assert.equal(stats.skipped[SKIP_REASONS.NO_VALIDATION], 1);
+            assert.equal(stats.skipped[SKIP_REASONS.LOW_GROUNDING], 1);
+
+            rows = [];
+            stats = processAll(root, { ...base, requireJudgePass: true }, (r) => rows.push(r));
+            assert.equal(rows.length, 1);
+            assert.equal(rows[0].meta.tx, TX_A);
+            assert.equal(stats.skipped[SKIP_REASONS.JUDGE_NOT_GOOD], 1, 'low has no judge');
+            assert.equal(stats.skipped[SKIP_REASONS.NO_VALIDATION], 1);
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it('resolveConfig parses gate env vars and rejects out-of-range values', () => {
+        const cfg = resolveConfig({ REQUIRE_VALIDATION: '1', MIN_GROUNDING_RATIO: '0.75', MIN_JUDGE_SCORE: '4', REQUIRE_JUDGE_PASS: '1' });
+        assert.equal(cfg.requireValidation, true);
+        assert.equal(cfg.minGroundingRatio, 0.75);
+        assert.equal(cfg.minJudgeScore, 4);
+        assert.equal(cfg.requireJudgePass, true);
+        const def = resolveConfig({});
+        assert.equal(def.requireValidation, false);
+        assert.equal(def.minGroundingRatio, 0);
+        assert.equal(def.minJudgeScore, 0);
+        assert.equal(def.requireJudgePass, false);
+        assert.throws(() => resolveConfig({ MIN_GROUNDING_RATIO: '1.5' }), /MIN_GROUNDING_RATIO/);
+        assert.throws(() => resolveConfig({ MIN_JUDGE_SCORE: '6' }), /MIN_JUDGE_SCORE/);
     });
 });
 

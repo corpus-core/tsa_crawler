@@ -9,7 +9,8 @@ The pipeline is:
 3. **Query** the resulting prompts so you can inspect coverage and pick training examples.
 4. **Dedup** clusters similar contracts and copies a CAP-sized keep-set for training.
 5. **Teacher responses** are generated with `src/gen_responses.mjs` (DeepSeek API).
-6. **Export** the paired prompts + responses as SFT JSONL with `src/export_dataset.mjs`.
+6. **Validate** the responses with `src/validate_responses.mjs` (number grounding + sampled LLM judge).
+7. **Export** the paired prompts + responses as SFT JSONL with `src/export_dataset.mjs`.
 
 ```
 Geth (eth + debug)
@@ -27,7 +28,8 @@ src/query.mjs             →  filter / dump prompts
 src/dedup.mjs             →  CAP keep-set under OUT (same layout)
         │
         ▼
-src/gen_responses.mjs     →  <txhash>_response.json (teacher answers from DeepSeek)
+src/gen_responses.mjs     →  <txhash>_response.json   (teacher answers from DeepSeek)
+src/validate_responses.mjs→  <txhash>_validation.json (number grounding + judge)
 src/export_dataset.mjs    →  train.jsonl + val.jsonl + manifest.json (SFT dataset)
 ```
 
@@ -49,6 +51,7 @@ Traces and derived files live under `OUT` / `IN` / `DATA_DIR` (defaults: `./trac
         0x<txhash>_prompt.json
         0x<txhash>_prompt.nosrc
         0x<txhash>_response.json  # teacher answers (one entry per style)
+        0x<txhash>_validation.json # grounding ratio + judge verdict per style
   .state.json                   # collector cursor (last processed block)
 ```
 
@@ -147,8 +150,24 @@ DATA_DIR=./test_data npm run query -- -q events:Approval -l 20
 | `-min` / `-max` | First userPrompt length |
 | `-l <n>` | Stop after n matches |
 | `-d` | Print path + prompt (colorized sections on a TTY) |
-| `-t` | Like `-d`, plus the sibling `_sim.json` |
+| `-s` | Like `-d`, plus the siblings when present: `_sim.json` (light blue), the teacher answer from `_response.json` (light green), and the `_validation.json` summary (magenta) |
+| `-v` | Keep only txs whose `_validation.json` reports a problem (grounding verdict `warn`/`fail`, or judge verdict not `good`). Combine with `-s` to review the flagged answers |
+| `-t <0\|1>` | Keep txs whose collector trace has / lacks `.trace.call` |
+| `-e` / `-E` | Keep txs whose listed sections are / are not resolved |
+| `-S` | Print hit / dataset counts |
+| `-x` / `-X` | Delete the collector trace of matching txs / the whole tx incl. all siblings (prunes empty dirs) |
+| `-R` | Delete only `_response.json` + `_validation.json` of matching txs; prompt, sim, and trace stay, so the next `gen-responses` / `validate-responses` run regenerates them |
 | `-h` | Help |
+
+Review loop for teacher answers after `validate-responses`:
+
+```bash
+DATA_DIR=./dedup node src/query.mjs -v -S          # how many flagged?
+DATA_DIR=./dedup node src/query.mjs -v -s -l 5     # read prompt, answer, and why it was flagged
+DATA_DIR=./dedup node src/query.mjs -v -R          # drop the flagged answers ...
+DATA_DIR=./dedup DEEPSEEK_API_KEY=sk-... npm run gen-responses       # ... and regenerate only those
+DATA_DIR=./dedup DEEPSEEK_API_KEY=sk-... npm run validate-responses
+```
 
 ---
 
@@ -241,11 +260,67 @@ Cost note: thinking mode charges its reasoning stream as output tokens; use `THI
 
 ---
 
-## 6. Export dataset — `src/export_dataset.mjs`
+## 6. Validate responses — `src/validate_responses.mjs`
+
+Checks every `_response.json` against its `_prompt.json` and writes a sibling `<txhash>_validation.json`. Two layers:
+
+1. **Deterministic number grounding** (always, no API). Every non-trivial number in the answer must be traceable to the user prompt. Accepted derivations: literal token (`97,476` → `97476`), hex value (`0x29` → `41`), decimal scaling by `SCALE_EXPONENTS` (`1,000` ↔ `1000000000000000000000`), the decimals count implied by an `x (raw: y)` pair, and rounding/truncation to the answer's own precision (`139.23 USDT` from `139231085`). Hex tokens, truncated addresses (`0x2127...e880`), and standard ids (`ERC-20`, `EIP-1559`) are masked first. The result is a `ratio = grounded / total` and a verdict: `pass` (≥ `RATIO_PASS`), `warn` (≥ `RATIO_WARN`), else `fail`. Unmatched numbers are listed so you can see *what* the teacher made up (or summed).
+2. **LLM judge** (sampled). A seed-stable `JUDGE_SAMPLE_PCT` of txs (`sha256(seed, txhash)`) is graded by DeepSeek against the same prompt. The judge returns strict JSON `{score 1–5, verdict good|flawed|wrong, issues[]}`; unparseable replies are stored as `verdict: "unparseable"` and retried on the next run. Raising the percentage later only adds txs, existing verdicts are reused.
+
+```bash
+DATA_DIR=./dedup node src/validate_responses.mjs --dry-run           # counts + judge token estimate, no writes
+DATA_DIR=./dedup JUDGE_SAMPLE_PCT=0 node src/validate_responses.mjs  # deterministic only, no API key needed
+DATA_DIR=./dedup DEEPSEEK_API_KEY=sk-... LIMIT=3 npm run validate-responses
+```
+
+| Env / flag | Default | Meaning |
+| --- | --- | --- |
+| `DATA_DIR` | *(required)* | Prompt tree root |
+| `STYLES` | `simple` | Styles to validate |
+| `TRIVIAL_MAX` | `2` | Integers `≤ n` are ignored (`0 -> 1`, "2 events"); fractions never are |
+| `RATIO_PASS` / `RATIO_WARN` | `0.9` / `0.7` | Verdict thresholds |
+| `SCALE_EXPONENTS` | `6,8,9,18` | Token decimals tried for scaled matches |
+| `JUDGE_SAMPLE_PCT` | `5` | Percent of txs sent to the judge; `0` disables it (then no API key is needed) |
+| `JUDGE_SEED` | `1` | Sample salt |
+| `JUDGE_MODEL` / `JUDGE_THINKING` / `JUDGE_REASONING_EFFORT` / `JUDGE_MAX_TOKENS` | `deepseek-v4-pro` / `enabled` / `high` / `16384` | Judge request (reasoning tokens count against the cap; too low → `finish_reason=length`, stored as `unparseable`) |
+| `DEEPSEEK_API_KEY` | | Required only when judge calls are planned |
+| `CONCURRENCY` / `MAX_RETRIES` / `TIMEOUT_MS` | `4` / `5` / `600000` | Same semantics as gen-responses |
+| `FORCE` | | `1` recomputes everything |
+| `FORCE_JUDGE` | | `1` re-judges sampled txs, keeps the deterministic part |
+| `LIMIT` / `--limit` | | Cap judge calls (unjudged sampled txs stay pending) |
+| `--dry-run` | | No API calls, no writes |
+
+A check is **fresh** when its `contentSha256` equals the current response content; fresh checks are skipped, so re-runs after `gen-responses` only touch new or regenerated answers. Each `_validation.json`:
+
+```json
+{
+  "version": 1, "txHash": "0x…", "codehash": "…", "methodId": "…",
+  "checks": {
+    "simple": {
+      "checkedAt": "…", "responseModel": "deepseek-v4-pro",
+      "promptSha256": "…", "contentSha256": "…", "sampled": true,
+      "deterministic": {
+        "numbers": { "total": 9, "grounded": 7, "ratio": 0.7778, "unmatched": ["4.93"], "trivialMax": 2,
+                     "matchModes": { "literal": 1, "hex": 0, "scaled": 3, "decimals": 0, "rounded": 3 } },
+        "verdict": "warn", "thresholds": { "pass": 0.9, "warn": 0.7 }
+      },
+      "judge": { "model": "deepseek-v4-pro", "score": 4, "verdict": "good", "issues": [], "usage": { "…": 0 }, "…": "…" }
+    }
+  }
+}
+```
+
+Use `query -v` (optionally with `-s`) to review the flagged answers; use the export gates below to keep them out of the dataset.
+
+---
+
+## 7. Export dataset — `src/export_dataset.mjs`
 
 Pairs every `_prompt.json` with its sibling `_response.json` and emits one JSONL row per (tx × style) in the standard OpenAI chat-messages shape. TRL `SFTTrainer`, Unsloth, and Axolotl consume it directly.
 
 The train/val split is **deterministic and codehash-cohesive**: every tx sharing a codehash goes into the same split, so validation never leaks contract-specific idioms from training. Rows whose `promptSha256` no longer matches the current prompt (e.g. the prompt was regenerated with a different source budget), whose `finishReason != "stop"`, or with empty content are skipped and counted by reason.
+
+Optional **quality gates** read the sibling `_validation.json`. All are off by default; a stale check (`contentSha256` mismatch) counts as missing.
 
 ```bash
 DATA_DIR=./dedup node src/export_dataset.mjs --dry-run
@@ -261,6 +336,10 @@ DATA_DIR=./dedup npm run export-dataset -- --out ./train_data/sft
 | `VAL_RATIO` | `0.05` | Fraction of codehashes for `val.jsonl` (0 disables val) |
 | `SEED` | `1` | Salt for the codehash split hash |
 | `TEACHER_SYSTEM_SUFFIX` | *(empty)* | Must match the value used at generation time |
+| `REQUIRE_VALIDATION` | *(off)* | `1`: rows without a fresh `_validation.json` check → skip `no-validation` / `stale-validation` |
+| `MIN_GROUNDING_RATIO` | `0` | Rows with `numbers.ratio < X` → skip `low-grounding` (unvalidated rows pass unless `REQUIRE_VALIDATION`) |
+| `MIN_JUDGE_SCORE` | `0` | Rows with `judge.score < X` → skip `low-judge` (only where a judge ran) |
+| `REQUIRE_JUDGE_PASS` | *(off)* | `1`: keep only `judge.verdict == "good"`; unjudged rows → skip `judge-not-good` |
 | `PROGRESS_EVERY` | `500` | Log `export: scanned N ...` every N prompt files (`0` = off) |
 | `--dry-run` | | Stats only; no files written |
 | `-h` | | Help |
@@ -269,10 +348,13 @@ Each JSONL row:
 
 ```json
 {"messages":[{"role":"system","content":"…"},{"role":"user","content":"…"},{"role":"assistant","content":"…"}],
- "meta":{"tx":"0x…","codehash":"…","method_id":"…","style":"simple","model":"deepseek-v4-pro","prompt_tokens":0,"completion_tokens":0,"rel_path":"…"}}
+ "meta":{"tx":"0x…","codehash":"…","method_id":"…","style":"simple","model":"deepseek-v4-pro","prompt_tokens":0,"completion_tokens":0,"rel_path":"…",
+         "validation":{"grounding_ratio":1,"grounding_verdict":"pass","judge_score":5,"judge_verdict":"good"}}}
 ```
 
-The run also writes `manifest.json` with counts, per-reason skip totals, token sums, distinct codehashes per split, and character-length percentiles for user + assistant messages.
+`meta.validation` is present only when a fresh check exists, so downstream filtering is possible without re-exporting. The run also writes `manifest.json` (`version: 2`) with counts, per-reason skip totals, token sums, distinct codehashes per split, character-length percentiles, and a `validation` block (active gates, rows validated/judged, grounding-ratio mean/p10/p50, judge-score histogram).
+
+Typical feasibility-study setting: `MIN_GROUNDING_RATIO=0.7` drops the `fail` verdicts while keeping unvalidated rows; add `REQUIRE_VALIDATION=1` once every response has been validated.
 
 ---
 
@@ -286,15 +368,19 @@ The run also writes `manifest.json` with counts, per-reason skip totals, token s
 | `prepare` | `Dockerfile.prepare` | `src/prepare-testdata.mjs` plus a built explainer; outbound HTTPS for Sourcify |
 | `dedup` | `Dockerfile.dedup` | One-shot `src/dedup.mjs`; profile `dedup`, does not start with `up` |
 | `gen-responses` | `Dockerfile.gen_responses` | One-shot `src/gen_responses.mjs`; profile `gen-responses`, does not start with `up`. Reads the deduped keep-set at `/data/traces/train` and writes sibling `_response.json` files via the DeepSeek API |
+| `validate-responses` | `Dockerfile.validate_responses` | One-shot `src/validate_responses.mjs`; profile `validate-responses`, does not start with `up`. Writes sibling `_validation.json` files; only the judge sample (`JUDGE_SAMPLE_PCT`, default 5 %) needs the API |
 
 ```bash
 docker compose --profile dedup run --rm dedup
 DEEPSEEK_API_KEY=sk-... docker compose --profile gen-responses run --rm gen-responses
 # Or put DEEPSEEK_API_KEY into an `.env` next to docker-compose.yml and just:
 docker compose --profile gen-responses run --rm gen-responses
+docker compose --profile validate-responses run --rm validate-responses
+# Deterministic-only pass (no API traffic):
+docker compose --profile validate-responses run --rm -e JUDGE_SAMPLE_PCT=0 validate-responses
 ```
 
-Dedup writes to `OUT=/data/traces/train` on the same volume; `gen-responses` reads from that path and drops `_response.json` beside every `_prompt.json`. Collector, prepare, and dedup must **not** share a `PROM_FILE` (`gen-responses` does not write metrics yet). Compose host paths and Loki labels are environment-specific — edit them before `docker compose up`. `DEEPSEEK_API_KEY` is required for the `gen-responses` profile; compose fails loudly if it is unset.
+Dedup writes to `OUT=/data/traces/train` on the same volume; `gen-responses` reads from that path and drops `_response.json` beside every `_prompt.json`; `validate-responses` adds `_validation.json` next to it. Collector, prepare, and dedup must **not** share a `PROM_FILE` (`gen-responses` / `validate-responses` do not write metrics yet). Compose host paths and Loki labels are environment-specific — edit them before `docker compose up`. `DEEPSEEK_API_KEY` is required for the `gen-responses` and `validate-responses` profiles; compose fails loudly if it is unset.
 
 ---
 

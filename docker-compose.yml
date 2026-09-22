@@ -191,3 +191,65 @@ services:
       - /srv/trace-data:/data/traces
 
     mem_limit: 1g
+
+  # One-shot response validation. Grounds every number in a _response.json
+  # against its _prompt.json (deterministic, no API) and sends a seed-stable
+  # JUDGE_SAMPLE_PCT sample to the DeepSeek judge. Writes a sibling
+  # _validation.json. Idempotent (skips entries whose contentSha256 matches).
+  # Run after gen-responses; export-dataset can gate on the results.
+  # Does not start with `up`:
+  #   docker compose --profile validate-responses run --rm validate-responses
+  # Deterministic-only pass without any API traffic:
+  #   docker compose --profile validate-responses run --rm -e JUDGE_SAMPLE_PCT=0 validate-responses
+  validate-responses:
+    build:
+      context: .
+      dockerfile: Dockerfile.validate_responses
+    image: colibri/trace-validate-responses:latest
+    container_name: trace-validate-responses
+    profiles: [ "validate-responses" ]
+    restart: "no"
+
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://193.26.158.2:3100/loki/api/v1/push"
+        loki-batch-size: "400"
+        loki-external-labels: "chain=mainnet,type=trace-validate-responses"
+
+    environment:
+      # Same tree gen-responses wrote to.
+      DATA_DIR: "/data/traces/train"
+      # Required only when JUDGE_SAMPLE_PCT > 0; the script fails loudly
+      # itself if judge calls are planned without a key. Keeping ":?" here so
+      # the default (5%) never silently runs unjudged.
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?DEEPSEEK_API_KEY is required (set it in .env or export it)}
+      DEEPSEEK_BASE_URL: "https://api.deepseek.com"
+      STYLES: "simple"
+      # Deterministic number grounding.
+      TRIVIAL_MAX: "2"
+      RATIO_PASS: "0.9"
+      RATIO_WARN: "0.7"
+      SCALE_EXPONENTS: "6,8,9,18"
+      # LLM judge sample. 0 disables the judge entirely.
+      JUDGE_SAMPLE_PCT: "5"
+      JUDGE_SEED: "1"
+      JUDGE_MODEL: "deepseek-v4-pro"
+      JUDGE_THINKING: "enabled"
+      JUDGE_REASONING_EFFORT: "high"
+      JUDGE_MAX_TOKENS: "16384"
+      CONCURRENCY: "4"
+      MAX_RETRIES: "5"
+      TIMEOUT_MS: "600000"
+      PROGRESS_EVERY: "100"
+      # Optional smoke-run cap on judge calls (e.g. LIMIT=3); empty = all.
+      LIMIT: ""
+      # FORCE=1 recomputes everything incl. judge; FORCE_JUDGE=1 only re-judges.
+      FORCE: ""
+      FORCE_JUDGE: ""
+      CHAIN: "mainnet"
+
+    volumes:
+      - /srv/trace-data:/data/traces
+
+    mem_limit: 1g

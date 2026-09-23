@@ -40,9 +40,9 @@ describe('functionNameFromPrompt', () => {
         assert.equal(functionNameFromPrompt(text), 'stakeWithPermit');
     });
 
-    it('falls back to the selector when the call did not decode', () => {
+    it('returns empty when the call did not decode', () => {
         const text = '## Transaction Overview\n- Function selector: 0x095ea7b3\n\n## Emitted Events\n';
-        assert.equal(functionNameFromPrompt(text), '0x095ea7b3');
+        assert.equal(functionNameFromPrompt(text), '');
     });
 });
 
@@ -124,6 +124,23 @@ describe('recordLatestExample', () => {
         assert.equal(latestLimit('15'), 15);
     });
 
+    it('does not record a prompt that only has a function selector', async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'latest-selector-'));
+        const trace = path.join(root, '0b', 'cd'.repeat(31), '00df0007', `${HASH}.json`);
+        fs.mkdirSync(path.dirname(trace), { recursive: true });
+        const written = await recordLatestExample({
+            root,
+            traceFile: trace,
+            userPrompt: '## Transaction Overview\n- Function selector: 0x00df0007\n',
+            contracts: new Map(),
+            meta: { txHash: HASH, from: '0x1', to: '0x2', input: '0x', value: '0x0' },
+            limit: 200,
+            fileName: 'latest.json',
+        });
+        assert.equal(written, null);
+        assert.equal(fs.existsSync(path.join(root, 'latest.json')), false);
+    });
+
     it('backfills the newest existing prompts and ignores vendor contracts', () => {
         const root = fs.mkdtempSync(path.join(os.tmpdir(), 'latest-backfill-'));
         const older = writePair(root, 1, 'older');
@@ -137,6 +154,22 @@ describe('recordLatestExample', () => {
         assert.equal(rows[0].contract, 'Token');
         assert.equal(backfillLatestExamples(root, [older.trace, newer.trace], 1), null);
         assert.equal(contractNameFromPrompt(PROMPT), '');
+    });
+
+    it('replaces selector rows and keeps scanning past unresolved prompts', () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'latest-resolved-'));
+        const named = writePair(root, 1, 'deposit');
+        const unresolved = writeSelectorPair(root, 2);
+        const newer = Date.now() / 1000;
+        fs.utimesSync(unresolved.prompt, newer, newer);
+        fs.writeFileSync(path.join(root, 'latest.json'), JSON.stringify([
+            { txhash: '0x' + 'ff'.repeat(32), function: '0x00df0007', contract: '', meta: {}, path: 'x' },
+        ]));
+        const written = backfillLatestExamples(root, [named.trace, unresolved.trace], 1);
+        const rows = JSON.parse(fs.readFileSync(written, 'utf8'));
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].function, 'deposit');
+        assert.equal(rows[0].txhash, '0x' + '1'.padStart(64, '0'));
     });
 });
 
@@ -152,6 +185,20 @@ function writePair(root, n, fnName) {
     const userPrompt = `## Transaction Overview\n- Function: ${fnName}(x=1)\n\n`
         + '<<<C4_UNTRUSTED_SOURCE filename="@openzeppelin/contracts/access/Ownable.sol">>> contract Ownable { <<<C4_END_UNTRUSTED_SOURCE>>>\n'
         + '<<<C4_UNTRUSTED_SOURCE filename="contracts/Token.sol">>> contract Token { <<<C4_END_UNTRUSTED_SOURCE>>>';
+    fs.writeFileSync(prompt, JSON.stringify([{ style: 'simple', userPrompt }]));
+    return { trace, prompt };
+}
+
+function writeSelectorPair(root, n) {
+    const hash = '0x' + n.toString(16).padStart(64, '0');
+    const dir = path.join(root, 'aa', 'bb'.repeat(31), '00df0007');
+    fs.mkdirSync(dir, { recursive: true });
+    const trace = path.join(dir, `${hash}.json`);
+    fs.writeFileSync(trace, JSON.stringify({
+        meta: { txHash: hash, from: '0x1', to: '0x2', input: '0x', value: '0x1' },
+    }));
+    const prompt = path.join(dir, `${hash}_prompt.json`);
+    const userPrompt = '## Transaction Overview\n- Function selector: 0x00df0007\n';
     fs.writeFileSync(prompt, JSON.stringify([{ style: 'simple', userPrompt }]));
     return { trace, prompt };
 }

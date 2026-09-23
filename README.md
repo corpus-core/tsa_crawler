@@ -111,7 +111,7 @@ Each `_prompt.json` is an array of two objects:
 
 Both share the same user prompt (decoded tx, events, state, call tree, Sourcify source). If Sourcify has no source, prepare writes `_prompt.nosrc` so later runs skip that tx.
 
-Each successful prompt is also appended to `<IN>/latest.json` (default cap 200, `LATEST_LIMIT=0` disables). The oldest row is dropped once the cap is reached. A row is `{ txhash, function, contract, meta: { from, to, input, value }, path }`, with `path` pointing at that tx's `_sim.json` relative to `IN`. The static trace server exposes this file at `/traces/latest.json`.
+Each successful prompt whose transaction section decodes a function name (`- Function:`) is also appended to `<IN>/latest.json` (default cap 200, `LATEST_LIMIT=0` disables). A bare `- Function selector:` is left out. The oldest row is dropped once the cap is reached. A row is `{ txhash, function, contract, meta: { from, to, input, value }, path }`, with `path` pointing at that tx's `_sim.json` relative to `IN`. The static trace server exposes this file at `/traces/latest.json`.
 
 The explainer is not in this repo. By default it is loaded from a sibling checkout:
 

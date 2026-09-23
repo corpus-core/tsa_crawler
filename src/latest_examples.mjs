@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const TXHASH_RE = /^0x[0-9a-fA-F]{64}$/;
 const FUNCTION_RE = /^- Function: ([A-Za-z_][A-Za-z0-9_]*)/m;
-const SELECTOR_RE = /^- Function selector: (0x[0-9a-fA-F]{8})/m;
+const RESOLVED_FN_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CONTRACT_RE = /\b(?:abstract\s+)?contract\s+([A-Za-z_][A-Za-z0-9_]*)\b/;
 const VENDOR_RE = /openzeppelin|node_modules|solmate|forge-std/i;
 
@@ -68,8 +68,9 @@ export function txhashOf(meta, traceFile) {
  * Decoded function name from the simple prompt's transaction section.
  *
  * The explainer writes `- Function: name(...)` when the call decodes, and
- * `- Function selector: 0x........` otherwise. The name is the identifier
- * before `(`. A selector is returned only when no name is present.
+ * `- Function selector: 0x........` otherwise. Only the decoded identifier
+ * is returned; an unresolved selector yields an empty string so the rolling
+ * list can skip that transaction.
  *
  * @param {string} userPrompt
  * @return {string}
@@ -77,9 +78,7 @@ export function txhashOf(meta, traceFile) {
 export function functionNameFromPrompt(userPrompt) {
     const section = txSection(userPrompt);
     const named = section.match(FUNCTION_RE);
-    if (named) return named[1];
-    const selector = section.match(SELECTOR_RE);
-    return selector ? selector[1] : '';
+    return named ? named[1] : '';
 }
 
 /**
@@ -177,8 +176,10 @@ export function exampleEntry({ txhash, userPrompt, contract, meta, simRelPath: s
  * Record a successfully prepared transaction in the rolling list.
  *
  * Writes are serialized in-process. A missing or unreadable file starts a
- * new list. `limit <= 0` does nothing. Failures are the caller's to log;
- * this function throws on I/O errors after the prompt file is already in place.
+ * new list. `limit <= 0` does nothing, and so does a prompt whose
+ * transaction section has no decoded `- Function:` name. Failures are the
+ * caller's to log; this function throws on I/O errors after the prompt file
+ * is already in place.
  *
  * @param {object} args
  * @param {string} args.root trace root (`IN`)
@@ -204,6 +205,7 @@ export function recordLatestExample(args) {
         meta: args.meta,
         simRelPath: simRelPath(args.root, args.traceFile),
     });
+    if (!isResolvedFunction(entry.function)) return Promise.resolve(null);
     return enqueue(() => {
         const next = pushLatest(readLatest(file), entry, limit);
         writeAtomic(file, next);
@@ -237,8 +239,9 @@ export function contractNameFromPrompt(userPrompt) {
  * Fill `latest.json` from prompts already on disk until it reaches `limit`.
  *
  * Prepare skips traces that already have `_prompt.json`, so a newly deployed
- * index would stay empty. This reads the newest prompt files (by mtime),
- * oldest of that window first, and does nothing once the file is full.
+ * index would stay empty. Rows whose function is only a selector are dropped,
+ * then the newest prompts with a decoded `- Function:` name fill the gap.
+ * Nothing is written once every kept row is resolved and the file is full.
  *
  * @param {string} root
  * @param {string[]} traces collector trace paths
@@ -248,8 +251,10 @@ export function contractNameFromPrompt(userPrompt) {
 export function backfillLatestExamples(root, traces, limit = latestLimit()) {
     if (limit <= 0) return null;
     const file = latestPath(root);
-    const current = readLatest(file);
-    if (current.length >= limit) return null;
+    const raw = readLatest(file);
+    let list = raw.filter((row) => row && isResolvedFunction(row.function));
+    const dropped = list.length !== raw.length;
+    if (!dropped && list.length >= limit) return null;
     const found = [];
     for (const trace of traces) {
         const promptFile = trace.replace(/\.json$/, '_prompt.json');
@@ -257,28 +262,34 @@ export function backfillLatestExamples(root, traces, limit = latestLimit()) {
         try { st = fs.statSync(promptFile); } catch { continue; }
         found.push({ trace, promptFile, mtime: st.mtimeMs });
     }
-    found.sort((a, b) => a.mtime - b.mtime);
-    const have = new Set(current.map((row) => row && row.txhash));
-    let list = current.slice();
-    let added = 0;
-    for (const item of found.slice(-limit)) {
+    found.sort((a, b) => b.mtime - a.mtime);
+    const have = new Set(list.map((row) => row && row.txhash));
+    const picked = [];
+    for (const item of found) {
+        if (list.length + picked.length >= limit) break;
         const meta = readTraceMeta(item.trace);
         const txhash = txhashOf(meta, item.trace);
         if (!txhash || have.has(txhash)) continue;
         const userPrompt = readSimpleUserPrompt(item.promptFile);
-        list = pushLatest(list, exampleEntry({
+        const entry = exampleEntry({
             txhash,
             userPrompt,
             contract: contractNameFromPrompt(userPrompt),
             meta,
             simRelPath: simRelPath(root, item.trace),
-        }), limit);
+        });
+        if (!isResolvedFunction(entry.function)) continue;
+        picked.push(entry);
         have.add(txhash);
-        added++;
     }
-    if (!added) return null;
+    if (!picked.length && !dropped) return null;
+    for (const entry of picked.reverse()) list = pushLatest(list, entry, limit);
     writeAtomic(file, list);
     return file;
+}
+
+function isResolvedFunction(name) {
+    return typeof name === 'string' && RESOLVED_FN_RE.test(name);
 }
 
 function readTraceMeta(traceFile) {

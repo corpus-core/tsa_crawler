@@ -24,7 +24,7 @@ RUN git clone --depth 1 --filter=blob:none --sparse --branch "${COLIBRI_REF}" "$
     && npm prune --omit=dev --omit=optional
 
 WORKDIR /app
-COPY src/prepare-testdata.mjs src/sim-from-trace.mjs src/proxy_accesslist.mjs src/bucket_paths.mjs ./
+COPY src/prepare-testdata.mjs src/latest_examples.mjs src/sim-from-trace.mjs src/proxy_accesslist.mjs src/bucket_paths.mjs ./
 
 USER node
 

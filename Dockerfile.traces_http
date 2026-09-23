@@ -1,0 +1,14 @@
+FROM nginx:1.27-alpine
+
+# Serves the collector trace volume (see docker/traces/default.conf.template).
+# The traces are NOT part of the image: mount the volume read-only at
+# /usr/share/nginx/html. `latest.json` at the volume root is the rolling
+# playground index written by prepare-testdata.
+#
+# NGINX_PORT lets the server run with `network_mode: host` next to other
+# services (the image entrypoint renders /etc/nginx/templates/*.template
+# into /etc/nginx/conf.d/ with envsubst).
+ENV NGINX_PORT=80
+COPY docker/traces/default.conf.template /etc/nginx/templates/default.conf.template
+
+HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- "http://127.0.0.1:${NGINX_PORT}/health" >/dev/null || exit 1

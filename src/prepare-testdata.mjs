@@ -12,6 +12,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { sloadsToAccessList, collectTraceSlots } from './proxy_accesslist.mjs';
 import { traceToSimulation, txParamsFromMeta, extractRevertData } from './sim-from-trace.mjs';
 import { listTraceFiles } from './bucket_paths.mjs';
+import { backfillLatestExamples, latestLimit, recordLatestExample } from './latest_examples.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const IN = process.env.IN || './test_data';
@@ -352,16 +353,24 @@ async function step2(traceFile, explainer) {
         return 'nosrc';
     }
     if (fs.existsSync(skip)) fs.unlinkSync(skip);
+    const simple = explainer.buildPrompt(sim, txParams, {}, context);
+    const detailed = explainer.buildPrompt(sim, txParams, { systemPrompt: DETAILED_SYSTEM_PROMPT, maxSourceChars: 0 }, context);
     writeAtomic(dest, [
-        {
-            style: 'simple',
-            ...explainer.buildPrompt(sim, txParams, {}, context),
-        },
-        {
-            style: 'detailed',
-            ...explainer.buildPrompt(sim, txParams, { systemPrompt: DETAILED_SYSTEM_PROMPT, maxSourceChars: 0 }, context),
-        },
+        { style: 'simple', ...simple },
+        { style: 'detailed', ...detailed },
     ], true);
+    try {
+        await recordLatestExample({
+            root: IN,
+            traceFile,
+            userPrompt: simple.userPrompt,
+            contracts: context?.contracts,
+            meta: file.meta,
+            limit: latestLimit(),
+        });
+    } catch (e) {
+        console.warn('latest.json:', path.basename(traceFile), e.message);
+    }
     return 'ok';
 }
 
@@ -386,6 +395,12 @@ function sleep(ms) {
 async function runOnce(explainer) {
     const all = listTraceFiles(IN);
     console.log(`prepare-testdata: ${all.length} traces in ${IN} steps=${STEPS.join(',')} rpc=${RPC}`);
+    try {
+        const filled = backfillLatestExamples(IN, all, latestLimit());
+        if (filled) console.log(`latest.json: filled from existing prompts -> ${filled}`);
+    } catch (e) {
+        console.warn('latest.json backfill:', e.message);
+    }
     snapshotCounts(all);
     writeMetrics();
 

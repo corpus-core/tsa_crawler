@@ -111,6 +111,8 @@ Each `_prompt.json` is an array of two objects:
 
 Both share the same user prompt (decoded tx, events, state, call tree, Sourcify source). If Sourcify has no source, prepare writes `_prompt.nosrc` so later runs skip that tx.
 
+Each successful prompt is also appended to `<IN>/latest.json` (default cap 200, `LATEST_LIMIT=0` disables). The oldest row is dropped once the cap is reached. A row is `{ txhash, function, contract, meta: { from, to, input, value }, path }`, with `path` pointing at that tx's `_sim.json` relative to `IN`. The static trace server exposes this file at `/traces/latest.json`.
+
 The explainer is not in this repo. By default it is loaded from a sibling checkout:
 
 `../colibri-stateless/bindings/emscripten/packages/explainer`
@@ -133,6 +135,8 @@ IN=./test_data RPC=https://mainnet1.colibri-proof.tech/execution node src/prepar
 | `C4_STATE_DIR` | `.` | Sourcify / solc cache |
 | `PROM_FILE` | *(off)* | Prometheus textfile path |
 | `CHAIN` | `mainnet` | Metric label |
+| `LATEST_LIMIT` | `200` | Rolling example list at `<IN>/latest.json`; `0` disables it |
+| `LATEST_FILE` | `latest.json` | File name under `IN`, or an absolute path |
 
 ---
 
@@ -476,6 +480,7 @@ MODEL_ROOT=/tmp/models docker compose --profile model up model   # serves <MODEL
 | `build-dataset` | `Dockerfile.build_dataset` | One-shot `src/build_dataset.mjs`; profile `build-dataset`, does not start with `up`. The normal way to run dedup + gen + validate + export |
 | `train` | `Dockerfile.train` | `train/tsa_train.py <subcommand>`; profile `train`. Python + Together SDK + MLC CPU wheels; mounts the keep-set volume and needs `TOGETHER_API_KEY` (and `HF_TOKEN` for `publish`) |
 | `model` | `Dockerfile.model` | nginx serving MLC weights from a read-only volume (`MODEL_ROOT`, default `/srv/tsa-models`) on `127.0.0.1:9501`; profile `model`. Weights are never baked into the image. On the server this is `tsa_models`, a named volume shared with `train` |
+| `traces` | `Dockerfile.traces_http` | nginx serving the trace volume read-only (`TRACE_ROOT`, default `/srv/trace-data`) on `127.0.0.1:9502`; profile `traces`. `latest.json` is not cached. On the server this is `mainnet_traces` behind `https://playground.colibri-proof.tech/traces/` (ufw must allow the load balancer on 9502) |
 
 ```bash
 docker compose --profile build-dataset run --rm build-dataset

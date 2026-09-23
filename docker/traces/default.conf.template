@@ -1,0 +1,57 @@
+# Static file server for collector traces and the rolling `latest.json` index.
+#
+# The document root is the trace volume (`mainnet_traces`), read-only:
+#   latest.json
+#   <codehash[0:2]>/<codehash[2:]>/<selector>/<txhash>_sim.json
+#
+# `latest.json` is rewritten as prepare succeeds, so it must not be cached.
+# Other files are stable once written. Directory listing is off: clients
+# use the paths in `latest.json`.
+#
+# nginx image template: envsubst replaces only variables that exist in the
+# environment (`NGINX_PORT`). `$uri` and `$request_method` stay.
+server {
+    listen ${NGINX_PORT};
+    server_name _;
+    root /usr/share/nginx/html;
+
+    sendfile on;
+    tcp_nopush on;
+    gzip off;
+    etag on;
+
+    default_type application/json;
+    types {
+        application/json json;
+        text/plain txt;
+    }
+
+    if ($request_method = OPTIONS) {
+        return 204;
+    }
+
+    location = /health {
+        access_log off;
+        default_type text/plain;
+        add_header Cache-Control "no-store" always;
+        add_header Access-Control-Allow-Origin "*" always;
+        return 200 "ok\n";
+    }
+
+    location = /latest.json {
+        add_header Access-Control-Allow-Origin "*" always;
+        add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "*" always;
+        add_header Cache-Control "no-store" always;
+        try_files $uri =404;
+    }
+
+    location / {
+        autoindex off;
+        add_header Access-Control-Allow-Origin "*" always;
+        add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "*" always;
+        add_header Cache-Control "public, max-age=300" always;
+        try_files $uri =404;
+    }
+}

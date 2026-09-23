@@ -8,6 +8,7 @@ The pipeline is:
 2. **Prepare** those traces into simulation JSON, then into two prompt styles (simple + detailed).
 3. **Query** the resulting prompts so you can inspect coverage and pick training examples.
 4. **Build the dataset** with `src/build_dataset.mjs`: dedup, teacher responses, validation, one regeneration pass, and the SFT export, in a single idempotent command. The sections below are the same stages runnable on their own.
+5. **Train** the student with `train/tsa_train.py`: LoRA fine-tune on Together AI, convert the merged weights to MLC, publish them for WebLLM.
 
 ```
 Geth (eth + debug)
@@ -29,6 +30,10 @@ src/build_dataset.mjs     →  dedup → gen → validate → regen → export
    src/gen_responses.mjs  →  <txhash>_response.json
    src/validate_responses.mjs → <txhash>_validation.json
    src/export_dataset.mjs →  TRAIN_DIR/dataset/{train,val}.jsonl + manifest.json
+        │
+        ▼
+train/tsa_train.py        →  Together AI LoRA job → merged HF checkpoint
+                          →  MLC q4f16_1 weights → Hugging Face → WebLLM model record
 ```
 
 Requires **Node 18+** (Docker images use Node 22). No npm dependencies in this repo; the collector uses Node builtins only. Prompt generation needs the Colibri explainer from [colibri-stateless](https://github.com/corpus-core/colibri-stateless).
@@ -192,6 +197,7 @@ DATA_DIR=./traces STAGES=gen,validate,export npm run build-dataset
 | `REQUIRE_RESOLVED` | `tx,events` | Forwarded to dedup |
 | `STICKY` | `1` | Forwarded to dedup |
 | `MIN_GROUNDING_RATIO` / `REQUIRE_VALIDATION` | `0.7` / `1` | Export gates for this pipeline only |
+| `MAX_USER_CHARS` | `60000` | Export gate: prompts longer than this are skipped (`too-long`), never truncated. Coarse guard only; the exact per-model sequence gate is `train/tsa_train.py prepare --max-seq-tokens` |
 | `--dry-run` | | Forwarded to every stage; no copies, no API calls, no writes |
 
 `dedup` or `export` failing stops the run. A teacher or judge call that fails after retries is logged and the other stages still run; the process then exits 1.
@@ -371,6 +377,7 @@ DATA_DIR=./dedup npm run export-dataset -- --out ./train_data/sft
 | `MIN_GROUNDING_RATIO` | `0` | Rows with `numbers.ratio < X` → skip `low-grounding` (unvalidated rows pass unless `REQUIRE_VALIDATION`) |
 | `MIN_JUDGE_SCORE` | `0` | Rows with `judge.score < X` → skip `low-judge` (only where a judge ran) |
 | `REQUIRE_JUDGE_PASS` | *(off)* | `1`: keep only `judge.verdict == "good"`; unjudged rows → skip `judge-not-good` |
+| `MAX_USER_CHARS` | `0` (off) | Skip rows whose `userPrompt` exceeds N characters → skip `too-long`. Rows are dropped, never truncated, so the training prompt stays byte-identical to what the explainer builds at inference |
 | `PROGRESS_EVERY` | `500` | Log `export: scanned N ...` every N prompt files (`0` = off) |
 | `--dry-run` | | Stats only; no files written |
 | `-h` | | Help |
@@ -387,6 +394,72 @@ Each JSONL row:
 
 Typical feasibility-study setting: `MIN_GROUNDING_RATIO=0.7` drops the `fail` verdicts while keeping unvalidated rows; add `REQUIRE_VALIDATION=1` once every response has been validated.
 
+Why drop instead of truncate: the last line of every user prompt is `Please explain what this transaction would do.`, and the teacher answered the full prompt. A truncated prompt would end mid-trace or mid-source, teach the student to answer prompts it will never see in production, and pair it with an answer that references data the student cannot see. The over-long rows (about 3 % at 60k chars) are dominated by huge `Call Trace` / `State Changes` / calldata sections, not by Solidity source, which the explainer already caps at `maxSourceChars` (10000 by default).
+
+---
+
+## 8. Train — `train/tsa_train.py`
+
+Python driver (Together AI SDK, Hugging Face Hub, MLC LLM) that turns `train.jsonl` / `val.jsonl` into WebLLM-loadable weights. Variants are declared in `train/variants.json`; `qwen3.5-4b` is the primary target, `qwen3.5-9b` (the "large" option, ~5 GB download) and `qwen3.5-2b` reuse the same dataset. All three have prebuilt WebLLM model libraries, so no WASM is compiled: only the weights change.
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r train/requirements.txt
+pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly-cpu mlc-ai-nightly-cpu   # convert step only
+export TOGETHER_API_KEY=... HF_TOKEN=... DATASET_OUT=./train_data/sft
+
+python train/tsa_train.py limits   --variant qwen3.5-4b # Together limits: max_seq_length_sft, LoRA rank
+python train/tsa_train.py prepare  --variant qwen3.5-4b # strip meta, token gate, upload (idempotent)
+python train/tsa_train.py preview  --variant qwen3.5-4b # tokenised rows; check the empty <think> prefix
+python train/tsa_train.py estimate --variant qwen3.5-4b
+python train/tsa_train.py create   --variant qwen3.5-4b # asks before spending
+python train/tsa_train.py wait     --variant qwen3.5-4b
+python train/tsa_train.py download --variant qwen3.5-4b # merged bf16 checkpoint
+python train/tsa_train.py convert  --variant qwen3.5-4b # MLC q4f16_1, checked against mlc-ai reference config
+python train/tsa_train.py serve    --variant qwen3.5-4b # local test: playground ?modelUrl=http://localhost:8787/
+python train/tsa_train.py sync     --variant qwen3.5-4b --dest /models # self-hosted (MODELS_DIR)
+python train/tsa_train.py publish  --variant qwen3.5-4b # Hugging Face upload + model_record.json
+
+# or all of prepare -> create -> wait -> download -> convert -> sync at once:
+python train/tsa_train.py pipeline --variant qwen3.5-4b --dry-run   # token gate + estimate, nothing paid
+python train/tsa_train.py pipeline --variant qwen3.5-4b --yes
+STAGES=download,convert,sync python train/tsa_train.py pipeline --variant qwen3.5-4b
+```
+
+| Step | Notes |
+| --- | --- |
+| `prepare` | Keeps only `messages`, enforces system/user-first + alternating roles, **drops rows whose rendered ChatML sequence exceeds `--max-seq-tokens`** (default: the variant's `context_window_size`; counted with the base model's own `tokenizer.json`), runs Together's local file check, uploads train + val once (SHA-256 tracked in `train/out/upload.json`, gate stats included). The gate is token-based on purpose: these prompts tokenise between 1.1 and 3.3 chars/token depending on their hex share, so no character cap predicts the sequence length |
+| `preview` | Together's tokenised rendering of sample rows. The assistant turn must start with `<think>\n\n</think>\n\n`: that is the prefix WebLLM injects with `enable_thinking: false`, so training and inference agree |
+| `limits` | `fine_tuning.model_limits` for the base model. Fails if the variant's `context_window_size` exceeds `max_seq_length_sft`; warns if the default LoRA rank exceeds `max_rank` |
+| `create` | LoRA SFT: `lora_r=32`, `lora_alpha=64`, `lr=1e-4`, 3 epochs, loss on assistant tokens only, `max_seq_length` = variant `context_window_size` (explicit, so Together never truncates rows silently). Prints the price estimate (about 18M Qwen tokens/epoch for the current dataset at 32k) and requires confirmation or `--yes` |
+| `download` | Uses the `together` CLI (`--checkpoint-type merged`, with an explicit output *file* — the CLI's `--output-dir` is a file path) and extracts the archive into `train/out/<variant>/merged/`. The format is detected from the content, not the name, and a finished download left under a temp name by an earlier run is adopted instead of fetched again |
+| `convert` | `mlc_llm convert_weight` + `gen_config` with `model_type`, `conv_template`, `context_window_size` and `prefill_chunk_size` taken from the reference `mlc-ai/Qwen3.5-*-q4f16_1-MLC` config; aborts if the produced config differs on any architecture field, because the prebuilt WASM would not load the weights |
+| `serve` | Static HTTP server (CORS, strips WebLLM's `resolve/main/` prefix) for `train/out/<variant>/mlc`. Open the playground with `?modelUrl=http://localhost:8787/` to run the converted weights in the browser before anything is published |
+| `sync` | `rsync` the MLC directory to `<dest>/<model_id>/<weights_version>/` (`--dest` or `MODELS_DIR`; local path such as the mounted `tsa_models` volume, or `host:/path`). That is the layout the `model` container serves; refuses to overwrite an existing version unless `--force`, because browsers cache shards by URL — bump `weights_version` in `variants.json` (and in the explainer's `TSA_EXPLAINER_MODELS`) for new weights instead |
+| `pipeline` | The orchestrator, the training counterpart of `build_dataset`: runs `prepare`, `create`, `wait`, `download`, `convert`, `sync` in that order, in-process. `STAGES` (or `--stages`) picks a subset; every stage skips work that is already recorded (`create` when a job exists, `download`/`convert`/`sync` when their output is there), so the command can be re-run after a failure. `--dry-run` stops after the token gate and the price estimate. `--yes` skips the TTY confirmation for the paid job; `--force-create` starts a new job despite a recorded one. Training args (`--epochs`, `--lora-r`, …) are the same as for `create` |
+| `publish` | `huggingface_hub.upload_folder` to `hf_repo`; writes `train/out/<variant>/model_record.json`, the `ModelRecord` the explainer registers in `TSA_EXPLAINER_MODELS` |
+| `eval-prep` / `endpoint` | Copy the val prompts into a standalone tree and start a dedicated Together endpoint, then run `gen_responses.mjs` + `validate_responses.mjs` against it to get the student's grounding ratio and judge score with the same metrics as the teacher. `endpoint down` afterwards; dedicated endpoints bill per GPU-hour |
+
+`train/out/` is gitignored. `Dockerfile.train` (`docker compose --profile train run --rm train <subcommand>`) bundles the Python dependencies and the MLC CPU wheels; `convert` needs roughly twice the bf16 checkpoint size in RAM.
+
+On the consumer side, `@corpus-core/colibri-explainer` lists the published models in `TSA_EXPLAINER_MODELS`, defaults to the 4B variant, merges the records into WebLLM's `prebuiltAppConfig`, and sends `extra_body.enable_thinking: false` so Qwen3.5 answers without a thinking block.
+
+### Self-hosting the weights (`Dockerfile.model`)
+
+While a model is not final it is not published to Hugging Face or any registry. Instead `Dockerfile.model` builds a plain nginx (`docker/model/default.conf.template`, port via `NGINX_PORT`) that serves a read-only volume laid out as `<model_id>/<weights_version>/…`, exactly what `sync` produces:
+
+- WebLLM appends `resolve/main/` to every model URL; nginx rewrites `/<id>/<ver>/resolve/<rev>/<file>` to `/<id>/<ver>/<file>`.
+- Every path is versioned, so files are served with `Cache-Control: immutable` and CORS `*`; `gzip` is off (q4f16 shards do not compress), directory listing is off, `/health` answers `ok`.
+- On the server the whole train step runs on `ccmainnet3`, where the dataset volumes already live: `mainnet_tsa_train` (this image, `Dockerfile.train`) mounts `mainnet_dedup` as `/data/train` and the `tsa_models` volume as `/models`; `pipeline`'s `sync` stage writes into it. `tsa_model` (`Dockerfile.model`) serves that volume in host network on `9501`, and the Caddy on `ccmainnet1` maps `https://playground.colibri-proof.tech/models/*` to it (ufw on ccmainnet3 must allow the lb's IP on 9501). The playground probes `<origin>/models/<model_id>/<weights_version>/mlc-chat-config.json` on load and, when present, uses that same-origin URL instead of the Hugging Face default; `?modelUrl=` still overrides both.
+
+```bash
+# on ccmainnet3 (devops/ccmainnet3):
+dc --profile train run --rm mainnet_tsa_train pipeline --variant qwen3.5-4b --yes
+# local check of the model container against train/out/<variant>/mlc:
+python train/tsa_train.py sync --variant qwen3.5-4b --dest /tmp/models
+MODEL_ROOT=/tmp/models docker compose --profile model up model   # serves <MODEL_ROOT>/<model_id>/<version>/
+```
+
 ---
 
 ## Docker
@@ -401,6 +474,8 @@ Typical feasibility-study setting: `MIN_GROUNDING_RATIO=0.7` drops the `fail` ve
 | `gen-responses` | `Dockerfile.gen_responses` | One-shot `src/gen_responses.mjs`; profile `gen-responses`, does not start with `up`. Reads the deduped keep-set at `/data/traces/train` and writes sibling `_response.json` files via the DeepSeek API |
 | `validate-responses` | `Dockerfile.validate_responses` | One-shot `src/validate_responses.mjs`; profile `validate-responses`, does not start with `up`. Writes sibling `_validation.json` files; only the judge sample (`JUDGE_SAMPLE_PCT`, default 5 %) needs the API |
 | `build-dataset` | `Dockerfile.build_dataset` | One-shot `src/build_dataset.mjs`; profile `build-dataset`, does not start with `up`. The normal way to run dedup + gen + validate + export |
+| `train` | `Dockerfile.train` | `train/tsa_train.py <subcommand>`; profile `train`. Python + Together SDK + MLC CPU wheels; mounts the keep-set volume and needs `TOGETHER_API_KEY` (and `HF_TOKEN` for `publish`) |
+| `model` | `Dockerfile.model` | nginx serving MLC weights from a read-only volume (`MODEL_ROOT`, default `/srv/tsa-models`) on `127.0.0.1:9501`; profile `model`. Weights are never baked into the image. On the server this is `tsa_models`, a named volume shared with `train` |
 
 ```bash
 docker compose --profile build-dataset run --rm build-dataset

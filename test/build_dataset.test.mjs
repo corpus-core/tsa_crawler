@@ -74,11 +74,12 @@ describe('parseArgs / resolveConfig', () => {
         assert.equal(cfg.sticky, '1');
         assert.equal(cfg.minGroundingRatio, '0.7');
         assert.equal(cfg.requireValidation, '1');
+        assert.equal(cfg.maxUserChars, '60000');
         assert.equal(cfg.regenRounds, 1);
         const off = resolveConfig({
             DATA_DIR: '/t', TRAIN_DIR: '/keep', DATASET_OUT: '/out',
             REQUIRE_RESOLVED: '', STICKY: '0', MIN_GROUNDING_RATIO: '0', REQUIRE_VALIDATION: '0',
-            REGEN_ROUNDS: '0', STAGES: 'dedup',
+            MAX_USER_CHARS: '', REGEN_ROUNDS: '0', STAGES: 'dedup',
         }, { dryRun: true });
         assert.equal(off.trainDir, '/keep');
         assert.equal(off.datasetOut, '/out');
@@ -86,6 +87,7 @@ describe('parseArgs / resolveConfig', () => {
         assert.equal(off.sticky, '0');
         assert.equal(off.minGroundingRatio, '0');
         assert.equal(off.requireValidation, '0');
+        assert.equal(off.maxUserChars, '');
         assert.equal(off.regenRounds, 0);
         assert.equal(off.dryRun, true);
         assert.deepEqual(off.stages, ['dedup']);

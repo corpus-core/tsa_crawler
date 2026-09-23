@@ -315,3 +315,57 @@ services:
       - /srv/node_exporter/textfile:/metrics
 
     mem_limit: 2g
+
+  # Fine-tuning driver. `pipeline` is the one-shot orchestrator (prepare ->
+  # create -> wait -> download -> convert -> sync), every stage idempotent;
+  # single subcommands work too. Reference only; the devops repo overrides
+  # volumes and keys. Examples:
+  #   docker compose run --rm train pipeline --variant qwen3.5-4b --dry-run
+  #   docker compose run --rm train pipeline --variant qwen3.5-4b --yes
+  #   docker compose run --rm -e STAGES=download,convert,sync train pipeline --variant qwen3.5-4b
+  # `convert` needs RAM for the merged bf16 checkpoint (~10 GB for 4B, ~20 GB for 9B).
+  train:
+    build:
+      context: .
+      dockerfile: Dockerfile.train
+    image: colibri/trace-train:latest
+    container_name: trace-train
+    profiles: [ "train" ]
+    restart: "no"
+
+    environment:
+      TOGETHER_API_KEY: ${TOGETHER_API_KEY:?TOGETHER_API_KEY is required (set it in .env.local)}
+      HF_TOKEN: ${HF_TOKEN:-}
+      DATASET_OUT: "/data/train/dataset"
+      TRAIN_DIR: "/data/train"
+      TRAIN_OUT: "/data/train/finetune"
+      # `sync` writes <MODELS_DIR>/<model_id>/<weights_version>/, the tree the
+      # `model` service serves.
+      MODELS_DIR: "/models"
+      STAGES: ""
+
+    volumes:
+      - /srv/trace-data/train:/data/train
+      - ${MODEL_ROOT:-/srv/tsa-models}:/models
+
+    mem_limit: 24g
+
+  # Static server for the converted MLC weights (WebLLM clients). The weights
+  # are a read-only volume laid out as <model_id>/<weights_version>/…, filled
+  # by `tsa_train.py sync`. Production runs this from
+  # devops/ccmainnet3/tsa_model (host network, NGINX_PORT=9501, `tsa_models`
+  # volume) behind the ccmainnet1 Caddy (/models/*); this entry is for local
+  # checks:
+  #   MODEL_ROOT=/tmp/models docker compose --profile model up model
+  model:
+    build:
+      context: .
+      dockerfile: Dockerfile.model
+    image: colibri/tsa-model:latest
+    container_name: tsa-model
+    profiles: [ "model" ]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9501:80"
+    volumes:
+      - ${MODEL_ROOT:-/srv/tsa-models}:/usr/share/nginx/html:ro

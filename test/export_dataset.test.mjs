@@ -385,18 +385,58 @@ describe('validationGate', () => {
     });
 
     it('resolveConfig parses gate env vars and rejects out-of-range values', () => {
-        const cfg = resolveConfig({ REQUIRE_VALIDATION: '1', MIN_GROUNDING_RATIO: '0.75', MIN_JUDGE_SCORE: '4', REQUIRE_JUDGE_PASS: '1' });
+        const cfg = resolveConfig({ REQUIRE_VALIDATION: '1', MIN_GROUNDING_RATIO: '0.75', MIN_JUDGE_SCORE: '4', REQUIRE_JUDGE_PASS: '1', MAX_USER_CHARS: '60000' });
         assert.equal(cfg.requireValidation, true);
         assert.equal(cfg.minGroundingRatio, 0.75);
         assert.equal(cfg.minJudgeScore, 4);
         assert.equal(cfg.requireJudgePass, true);
+        assert.equal(cfg.maxUserChars, 60000);
         const def = resolveConfig({});
         assert.equal(def.requireValidation, false);
         assert.equal(def.minGroundingRatio, 0);
         assert.equal(def.minJudgeScore, 0);
         assert.equal(def.requireJudgePass, false);
+        assert.equal(def.maxUserChars, 0, 'length gate is off by default');
         assert.throws(() => resolveConfig({ MIN_GROUNDING_RATIO: '1.5' }), /MIN_GROUNDING_RATIO/);
         assert.throws(() => resolveConfig({ MIN_JUDGE_SCORE: '6' }), /MIN_JUDGE_SCORE/);
+        assert.throws(() => resolveConfig({ MAX_USER_CHARS: '-5' }), /MAX_USER_CHARS/);
+        assert.throws(() => resolveConfig({ MAX_USER_CHARS: 'abc' }), /MAX_USER_CHARS/);
+    });
+
+    it('MAX_USER_CHARS drops (never truncates) over-long prompts before the response lookup', () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'exp-'));
+        try {
+            const longUser = 'x'.repeat(120);
+            const pShort = writePrompt(root, TX_A, HASH_A);
+            const pLong = writePrompt(root, TX_B, HASH_B, promptBody({ simpleUser: longUser }));
+            // A long prompt without any response must count as too-long, not
+            // no-response-file: the gate is independent of the teacher output.
+            writePrompt(root, TX_C, HASH_C, promptBody({ simpleUser: longUser }));
+            writeResponse(pShort, 'simple');
+            writeResponse(pLong, 'simple', { usr: longUser });
+
+            const base = { styles: ['simple'], valRatio: 0, seed: '1', teacherSystemSuffix: '' };
+            let rows = [];
+            let stats = processAll(root, { ...base, maxUserChars: 100 }, (r) => rows.push(r));
+            assert.equal(rows.length, 1);
+            assert.equal(rows[0].meta.tx, TX_A);
+            assert.equal(stats.skipped[SKIP_REASONS.TOO_LONG], 2);
+            assert.equal(stats.skipped[SKIP_REASONS.NO_RESPONSE_FILE], 0);
+
+            rows = [];
+            stats = processAll(root, { ...base, maxUserChars: 0 }, (r) => rows.push(r));
+            assert.equal(rows.length, 2, 'gate off keeps the long prompt intact');
+            const longRow = rows.find((r) => r.meta.tx === TX_B);
+            assert.equal(longRow.messages[1].content, longUser, 'content is never truncated');
+            assert.equal(stats.skipped[SKIP_REASONS.TOO_LONG], 0);
+            assert.equal(stats.skipped[SKIP_REASONS.NO_RESPONSE_FILE], 1);
+
+            const manifest = buildManifest(stats, { ...base, maxUserChars: 0 });
+            assert.equal(manifest.maxUserChars, 0);
+            assert.equal(buildManifest(stats, { ...base, maxUserChars: 100 }).maxUserChars, 100);
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
     });
 });
 

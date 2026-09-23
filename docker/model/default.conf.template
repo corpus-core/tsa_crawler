@@ -1,0 +1,56 @@
+# Static file server for MLC/WebLLM model weights.
+#
+# Directory layout under the document root (a read-only volume):
+#   <model_id>/<weights_version>/mlc-chat-config.json
+#   <model_id>/<weights_version>/ndarray-cache.json
+#   <model_id>/<weights_version>/params_shard_*.bin
+#   <model_id>/<weights_version>/tokenizer*.json, vocab.json, merges.txt
+#
+# WebLLM appends `resolve/main/` to every model URL (cleanModelUrl), so
+# `/<id>/<ver>/resolve/main/<file>` is rewritten to `/<id>/<ver>/<file>`.
+# Paths are versioned, therefore every file is immutable and cacheable for
+# a year; a new training run gets a new <weights_version> directory.
+#
+# This is an nginx image template: at container start envsubst replaces only
+# the variables that exist in the environment (`NGINX_PORT`, set in the
+# Dockerfile); `$uri`, `$request_method`, `$1` are left for nginx.
+server {
+    listen ${NGINX_PORT};
+    server_name _;
+    root /usr/share/nginx/html;
+
+    sendfile on;
+    tcp_nopush on;
+    # q4f16 weights are incompressible; gzip would only burn CPU.
+    gzip off;
+    etag on;
+
+    default_type application/octet-stream;
+    types {
+        application/json json;
+        application/octet-stream bin;
+        text/plain txt;
+    }
+
+    add_header Access-Control-Allow-Origin "*" always;
+    add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "*" always;
+    add_header Cache-Control "public, max-age=31536000, immutable" always;
+
+    if ($request_method = OPTIONS) {
+        return 204;
+    }
+
+    location = /health {
+        access_log off;
+        add_header Cache-Control "no-store" always;
+        return 200 "ok\n";
+    }
+
+    rewrite ^/(.+?)/resolve/[^/]+/(.*)$ /$1/$2 last;
+
+    location / {
+        autoindex off;
+        try_files $uri =404;
+    }
+}

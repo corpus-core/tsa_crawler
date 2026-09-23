@@ -1,6 +1,6 @@
 # Agent notes
 
-This repo builds **training prompts and teacher responses** for an SLM that explains Ethereum transactions. It is a small Node toolchain, not an app: collector → prepare → query, then `build_dataset` (dedup → gen-responses → validate-responses → export-dataset).
+This repo builds **training prompts and teacher responses** for an SLM that explains Ethereum transactions, and drives the fine-tune. It is a small Node toolchain plus one Python driver, not an app: collector → prepare → query, then `build_dataset` (dedup → gen-responses → validate-responses → export-dataset), then `train/tsa_train.py` (Together AI LoRA → MLC weights → Hugging Face).
 
 Read `README.md` for the human-facing pipeline and env vars. This file is for changing the code without breaking layout, CAP accounting, or the explainer contract.
 
@@ -17,7 +17,10 @@ All runnable code lives in `src/`. Tests stay in `test/` and import from `../src
 | `src/gen_responses.mjs` | Call DeepSeek Chat Completions with the student prompt; write sibling `_response.json`. `fetch` is injectable for tests. |
 | `src/validate_responses.mjs` | Deterministic number grounding of `_response.json` against the prompt plus a seed-stable sampled DeepSeek judge; writes sibling `_validation.json`. Imports `callDeepSeek` / `runPool` from `gen_responses.mjs` and the sibling-path helpers from `query.mjs`. |
 | `src/export_dataset.mjs` | Pair `_prompt.json` + `_response.json`, emit `train.jsonl` / `val.jsonl` / `manifest.json` with a codehash-cohesive split. Optional gates on `_validation.json`. |
-| `src/build_dataset.mjs` | In-process orchestrator. Calls each stage's `main(env, argv, io, deps)`. `STAGES` selects a subset; pipeline-only defaults (`REQUIRE_RESOLVED`, `STICKY`, export gates, regen) are applied here and stay off in the standalone tools. |
+| `src/build_dataset.mjs` | In-process orchestrator. Calls each stage's `main(env, argv, io, deps)`. `STAGES` selects a subset; pipeline-only defaults (`REQUIRE_RESOLVED`, `STICKY`, export gates incl. `MAX_USER_CHARS`, regen) are applied here and stay off in the standalone tools. |
+| `train/tsa_train.py` | Python CLI: `prepare` / `preview` / `estimate` / `create` / `status` / `wait` / `download` / `convert` / `serve` / `sync` / `pipeline` / `publish` / `eval-prep` / `endpoint`. Reads `DATASET_OUT`, writes only under `TRAIN_OUT` (default `train/out`, gitignored). `train/variants.json` maps a variant to Together base model, mlc-ai reference weights, prebuilt WebLLM WASM name, and HF repo. |
+| `Dockerfile.train` | python:3.12-slim + `train/requirements.txt` + MLC CPU nightly wheels from `https://mlc.ai/wheels`. Entry point is `tsa_train.py`. |
+| `Dockerfile.model` / `docker/model/default.conf.template` | nginx:alpine serving MLC weights from a read-only volume mounted at `/usr/share/nginx/html`, layout `<model_id>/<weights_version>/…`. The conf is an nginx-image envsubst template (`NGINX_PORT`, default 80); only defined env vars are substituted, nginx's `$uri`/`$1` stay. Weights are never copied into the image. Deployed from `devops/ccmainnet3/tsa_model` (host network, port 9501, `tsa_models` volume) behind the ccmainnet1 Caddy `/models/*`. |
 | `src/bucket_paths.mjs` | **Single source of truth** for on-disk layout. |
 | `src/proxy_accesslist.mjs` | Access list + proxy implementation resolution. |
 | `src/sim-from-trace.mjs` | Collector file → Colibri simulation JSON. |
@@ -101,7 +104,7 @@ The explainer lives **outside** this repo (`EXPLAINER_DIR`). Docker sets `SKIP_E
 
 - Calls `dedup` / `gen` / `validate` / `export` `main()` in-process. No shell. `deps` (`fetch`, `sleep`, `rng`, `now`) are forwarded to gen and validate; tests never hit the network.
 - `STAGES` default `dedup,gen,validate,export`, always in that order. `dedup` reads `DATA_DIR` and writes `TRAIN_DIR` (default `<DATA_DIR>/train`; the server sets `/data/train` because the keep-set is a separate volume). Later stages read `TRAIN_DIR`. Export writes `DATASET_OUT` (default `<TRAIN_DIR>/dataset`, a non-hex name so `walkBuckets` ignores it).
-- Pipeline-only defaults, applied only when the env var is unset (an empty value turns them off): `REQUIRE_RESOLVED=tx,events`, `STICKY=1`, `REGEN_ROUNDS=1`, `MIN_GROUNDING_RATIO=0.7`, `REQUIRE_VALIDATION=1`. Standalone `export-dataset` keeps every gate off.
+- Pipeline-only defaults, applied only when the env var is unset (an empty value turns them off): `REQUIRE_RESOLVED=tx,events`, `STICKY=1`, `REGEN_ROUNDS=1`, `MIN_GROUNDING_RATIO=0.7`, `REQUIRE_VALIDATION=1`, `MAX_USER_CHARS=60000`. Standalone `export-dataset` keeps every gate off.
 - Regen, after validate, only when both `gen` and `validate` are in `STAGES`: a **fresh** check with `deterministic.verdict === 'fail'` or `judge.verdict === 'wrong'` is deleted via `unlinkResponseFiles` and generated again, at most `REGEN_ROUNDS` times. `warn` and `flawed` are not redone. `--dry-run` counts them and deletes nothing.
 - Reset `process.exitCode` before each stage. `dedup` or `export` failing aborts the pipeline. A gen/validate exit 1 (individual calls failed) is remembered and the process exits 1 at the end. A missing `DEEPSEEK_API_KEY` fails before any write when a live gen or judge sample is planned.
 - `--dry-run` is forwarded to every stage. A dry-run dedup does not create `TRAIN_DIR`; later stages are skipped with a log line instead of failing their directory check.
@@ -139,7 +142,22 @@ The explainer lives **outside** this repo (`EXPLAINER_DIR`). Docker sets `SKIP_E
 - Split is deterministic: `sha256(SEED || codehash)` bucketed against `VAL_RATIO`. Every tx under the same codehash lands in the same split — do not weaken this or the val loss will underestimate generalisation.
 - `DATA_DIR` is read-only. The exporter writes only under `OUT` (`train.jsonl`, `val.jsonl`, `manifest.json`) with atomic writes.
 - Validation gates (`validationGate`) are all **off by default** and must never change the default export. A check whose `contentSha256` differs from the response content is stale and treated as missing. `REQUIRE_VALIDATION` / `REQUIRE_JUDGE_PASS` reject missing/stale checks (`no-validation` / `stale-validation`); `MIN_GROUNDING_RATIO` and `MIN_JUDGE_SCORE` only bite when a fresh check (resp. a judge result) exists. `REQUIRE_JUDGE_PASS` also rejects unjudged rows (`judge-not-good`).
-- `meta.validation` (`grounding_ratio`, `grounding_verdict`, `judge_score`, `judge_verdict`) is added to a row only when a fresh check exists. Manifest is `version: 2` and carries a `validation` block (gates, rows validated/judged, ratio mean/p10/p50, judge-score histogram).
+- `meta.validation` (`grounding_ratio`, `grounding_verdict`, `judge_score`, `judge_verdict`) is added to a row only when a fresh check exists. Manifest is `version: 2` and carries a `validation` block (gates, rows validated/judged, ratio mean/p10/p50, judge-score histogram) plus `maxUserChars`.
+- `MAX_USER_CHARS` (default 0 = off) skips rows whose `userPrompt.length` exceeds it (`too-long`), checked before the response lookup so `no-response-file` stays meaningful. **Never truncate** a prompt: the explainer builds the same prompt at inference, the closing sentence is the last line, and the teacher answer refers to the full content.
+
+## Training invariants (`train/tsa_train.py`)
+
+- Base models are the Qwen3.5 family only, because `@mlc-ai/web-llm` ships prebuilt model libraries for 2B/4B/9B and the explainer sends one `enable_thinking: false` path. Adding a variant means adding an entry to `train/variants.json`, not new code.
+- No WASM is compiled. `convert` runs `mlc_llm convert_weight` + `gen_config` with `model_type`, `conv_template`, `context_window_size`, `prefill_chunk_size` copied from the `mlc-chat-config.json` of `mlc_reference`, then fails if any of `REFERENCE_KEYS` or `conv_template.name` differ. The prebuilt WASM only runs weights that match its compiled architecture.
+- Non-thinking SFT: rows carry only `messages` (no `reasoning`). The Qwen3.5 chat template renders the final assistant turn as `<|im_start|>assistant\n<think>\n\n</think>\n\n{content}`, which is byte-identical to WebLLM's `enable_thinking: false` prefix. `preview` exists to confirm this on Together's tokenised output before `create`.
+- Money: `create` and `endpoint up` print the estimate / hourly price and require a TTY confirmation or `--yes`. `download` reuses the `together` CLI instead of internal SDK download classes. `prepare` re-uploads only when the upload JSONL's SHA-256 changed.
+- Sequence gate lives in `prepare`, not in the exporter: `count_tokens` renders the row as ChatML (`render_chatml`, with the empty think block) and tokenises it with the base model's `tokenizer.json`. Rows above `--max-seq-tokens` (default `context_window_size` of the variant) are dropped, never truncated. Character counts and the teacher's `prompt_tokens` are not proxies (measured 1.1–3.3 chars/token and a Qwen/DeepSeek ratio up to 2.3×).
+- Eval reuses the Node tooling: `eval-prep` copies the val `_prompt.json` files (via `meta.rel_path`) into `train/out/<variant>/eval/data`; `gen_responses.mjs` with `DEEPSEEK_BASE_URL` pointed at Together and `MODEL` set to the endpoint, then `validate_responses.mjs`. Do not add a second grading implementation in Python.
+- `TRAIN_OUT` may live under `TRAIN_DIR` (server: `/data/train/finetune`); `walkBuckets` ignores the non-hex name. `HF_HOME` is redirected there too so the container has no hidden cache.
+- Public model name is **Colibri TSA**: `model_id` `colibri-tsa-<size>-q4f16_1-MLC`, `hf_repo` `corpus-core/colibri-tsa-…`, Together suffix `colibri-tsa-<size>-vN`. Variant keys (`qwen3.5-4b`) name the base, not the product.
+- `download`: the `together` CLI's `--output-dir` is the output **file**; pass `<dl_dir>/<job>-merged.tar.zst`, never a directory (the SDK `shutil.move`s the finished temp file into an existing dir under its `tmpXXXX` name). `archive_format` sniffs zstd/gzip/tar magic instead of trusting the name, and a complete leftover temp file is adopted rather than downloaded again.
+- `pipeline` is the train-step orchestrator (counterpart of `build_dataset.mjs`): stages `prepare,create,wait,download,convert,sync` in that fixed order, `STAGES`/`--stages` selects a subset, each stage skips recorded work (`create` with an existing `job_id`, `download`/`convert` with existing output, `sync` with an existing version via `exists_ok`). Money still goes through `confirm` (`--yes`). `--dry-run` never uploads or creates. A missing `TOGETHER_API_KEY` fails before any stage runs when an API stage is selected. `MODELS_DIR` is the `sync` default (`/models` in the image = the `tsa_models` volume).
+- Self-hosted weights: `sync` rsyncs `train/out/<variant>/mlc/` to `<dest>/<model_id>/<weights_version>/` and refuses to overwrite an existing version without `--force`. Browsers cache shards by URL, so new weights need a new `weights_version` in **both** `train/variants.json` and the explainer's `TSA_EXPLAINER_MODELS`; never replace files in place under an existing version. `docker/model/default.conf.template` must keep the `resolve/<rev>/` rewrite (WebLLM's `cleanModelUrl` appends `resolve/main/`), CORS `*`, and `immutable` caching; `/health` is blocked at Caddy.
 
 ## Coding rules
 
@@ -159,6 +177,6 @@ That is `node --test test/*.test.mjs`. Run it after layout, query, sim, step-2a/
 
 ## Out of scope unless asked
 
-- Fine-tuning / training loop (this repo only **produces** prompts and teacher responses).
+- A local training loop (TRL/Unsloth). Training runs on Together AI through `train/tsa_train.py`; this repo never downloads base-model weights for training.
 - Changing compose host paths, Loki URLs, or production volume owners.
 - Force-push, amending others' commits, or committing `test_data/` / secrets.

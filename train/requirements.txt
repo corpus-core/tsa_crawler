@@ -1,0 +1,13 @@
+# Together AI SDK (fine-tuning API + `together` CLI used for checkpoint download).
+together>=2.35,<3
+# Hugging Face Hub: reference config download + publishing the MLC weights.
+huggingface_hub>=0.30
+# Merged checkpoints arrive as .tar.zst archives.
+zstandard>=0.22
+# Exact token counts with the base model's tokenizer.json (sequence-length gate in `prepare`).
+tokenizers>=0.20
+
+# MLC LLM is NOT listed here on purpose: it ships as platform-specific
+# nightly wheels from https://mlc.ai/wheels. Install it separately, e.g.
+#   pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly-cpu mlc-ai-nightly-cpu
+# (CPU wheels are enough for convert_weight / gen_config; no GPU needed.)

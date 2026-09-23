@@ -45,6 +45,7 @@ export const SKIP_REASONS = Object.freeze({
     LOW_GROUNDING: 'low-grounding',
     LOW_JUDGE: 'low-judge',
     JUDGE_NOT_GOOD: 'judge-not-good',
+    TOO_LONG: 'too-long',
 });
 
 export const HELP = `Usage: DATA_DIR=<dir> OUT=<dir> node src/export_dataset.mjs [options]
@@ -77,6 +78,10 @@ Env:
                         default 0 = off; rows without a judge pass) -> low-judge
   REQUIRE_JUDGE_PASS    1 = keep only rows whose judge verdict is "good"
                         (rows without a judge are skipped) -> judge-not-good
+  MAX_USER_CHARS        Skip rows whose userPrompt is longer than this many
+                        characters (default 0 = off) -> too-long. Rows are
+                        dropped, never truncated: the prompt must stay
+                        identical to what the explainer builds at inference.
   PROGRESS_EVERY        Log every N processed prompts (default 500; 0=off)
 `;
 
@@ -105,7 +110,7 @@ export function parseArgs(argv) {
 
 /**
  * @param {NodeJS.ProcessEnv} env
- * @return {{ styles: string[], valRatio: number, seed: string, teacherSystemSuffix: string, progressEvery: number, requireValidation: boolean, minGroundingRatio: number, minJudgeScore: number, requireJudgePass: boolean }}
+ * @return {{ styles: string[], valRatio: number, seed: string, teacherSystemSuffix: string, progressEvery: number, requireValidation: boolean, minGroundingRatio: number, minJudgeScore: number, requireJudgePass: boolean, maxUserChars: number }}
  */
 export function resolveConfig(env = process.env) {
     return {
@@ -120,6 +125,7 @@ export function resolveConfig(env = process.env) {
         minGroundingRatio: parseUnitRange(env.MIN_GROUNDING_RATIO, 0, 1, 'MIN_GROUNDING_RATIO'),
         minJudgeScore: parseUnitRange(env.MIN_JUDGE_SCORE, 0, 5, 'MIN_JUDGE_SCORE'),
         requireJudgePass: env.REQUIRE_JUDGE_PASS === '1',
+        maxUserChars: parseNonNegInt(env.MAX_USER_CHARS, 0, 'MAX_USER_CHARS'),
     };
 }
 
@@ -311,6 +317,7 @@ export function processAll(root, cfg, onRow, onSkip, onProgress) {
         validation: { validated: 0, judged: 0, ratios: [], judgeScores: {} },
     };
     const progressEvery = cfg.progressEvery || 0;
+    const maxUserChars = cfg.maxUserChars || 0;
     const recordSkip = (reason, relPath, style) => {
         stats.skipped[reason] = (stats.skipped[reason] || 0) + 1;
         onSkip?.(reason, relPath, style);
@@ -353,6 +360,11 @@ export function processAll(root, cfg, onRow, onSkip, onProgress) {
             for (const style of cfg.styles) {
                 const promptEntry = byStyle.get(style);
                 if (!promptEntry) { recordSkip(SKIP_REASONS.BAD_PROMPT, relPath, style); continue; }
+                // Length gate first: it does not depend on the response and
+                // keeps the "no-response-file" count meaningful for gen.
+                if (maxUserChars > 0 && promptEntry.userPrompt.length > maxUserChars) {
+                    recordSkip(SKIP_REASONS.TOO_LONG, relPath, style); continue;
+                }
                 if (!responseFile) { recordSkip(SKIP_REASONS.NO_RESPONSE_FILE, relPath, style); continue; }
                 const entry = responseFile.responses?.[style];
                 if (!entry || typeof entry !== 'object') { recordSkip(SKIP_REASONS.NO_STYLE_ENTRY, relPath, style); continue; }
@@ -439,6 +451,7 @@ export function buildManifest(stats, cfg) {
         skipped: stats.skipped,
         tokens: stats.tokens,
         models: stats.models,
+        maxUserChars: cfg.maxUserChars || 0,
         validation: {
             gates: {
                 requireValidation: !!cfg.requireValidation,
@@ -570,6 +583,7 @@ export function main(env = process.env, argv = process.argv.slice(2), io = conso
         cfg.minGroundingRatio ? `MIN_GROUNDING_RATIO=${cfg.minGroundingRatio}` : null,
         cfg.minJudgeScore ? `MIN_JUDGE_SCORE=${cfg.minJudgeScore}` : null,
         cfg.requireJudgePass ? 'REQUIRE_JUDGE_PASS' : null,
+        cfg.maxUserChars ? `MAX_USER_CHARS=${cfg.maxUserChars}` : null,
     ].filter(Boolean);
     io.log(`export-dataset: scanning ${dataDir} styles=${cfg.styles.join(',')} valRatio=${cfg.valRatio} seed=${cfg.seed} gates=${gates.length ? gates.join(',') : 'none'}${flags.dryRun ? ' dry-run' : ''}`);
 

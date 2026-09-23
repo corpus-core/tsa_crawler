@@ -24,6 +24,11 @@ export const DEFAULT_STAGES = Object.freeze(['dedup', 'gen', 'validate', 'export
 export const DEFAULT_REGEN_ROUNDS = 1;
 export const DEFAULT_REQUIRE_RESOLVED = 'tx,events';
 export const DEFAULT_MIN_GROUNDING_RATIO = '0.7';
+// Coarse guard against pathological prompts (the largest seen is 555k chars).
+// The exact per-model sequence gate is token-based and lives in
+// train/tsa_train.py `prepare`; character counts do not predict tokens here
+// (1.1–3.3 chars/token depending on the hex share).
+export const DEFAULT_MAX_USER_CHARS = '60000';
 
 const STAGE_SET = new Set(DEFAULT_STAGES);
 
@@ -48,6 +53,7 @@ Env:
   STICKY                Passed to dedup (default 1)
   MIN_GROUNDING_RATIO   Export gate (default ${DEFAULT_MIN_GROUNDING_RATIO})
   REQUIRE_VALIDATION    Export gate (default 1)
+  MAX_USER_CHARS        Export gate (default ${DEFAULT_MAX_USER_CHARS}; empty or 0 = off)
   CAP, STYLES, JUDGE_SAMPLE_PCT, LIMIT, DEEPSEEK_*, FORCE, ...
                         Forwarded to the stage that reads them
 `;
@@ -120,6 +126,7 @@ export function resolveConfig(env = process.env, flags = {}) {
         sticky: env.STICKY === undefined ? '1' : String(env.STICKY),
         minGroundingRatio: env.MIN_GROUNDING_RATIO === undefined ? DEFAULT_MIN_GROUNDING_RATIO : String(env.MIN_GROUNDING_RATIO),
         requireValidation: env.REQUIRE_VALIDATION === undefined ? '1' : String(env.REQUIRE_VALIDATION),
+        maxUserChars: env.MAX_USER_CHARS === undefined ? DEFAULT_MAX_USER_CHARS : String(env.MAX_USER_CHARS),
     };
 }
 
@@ -232,6 +239,7 @@ export async function main(env = process.env, argv = process.argv.slice(2), io =
         OUT: cfg.datasetOut,
         MIN_GROUNDING_RATIO: cfg.minGroundingRatio,
         REQUIRE_VALIDATION: cfg.requireValidation,
+        MAX_USER_CHARS: cfg.maxUserChars,
     };
 
     let failed = false;

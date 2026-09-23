@@ -1,0 +1,33 @@
+FROM python:3.12-slim
+
+# Fine-tuning driver: Together AI job control, checkpoint download, MLC
+# weight conversion (CPU wheels; no GPU needed for convert_weight/gen_config
+# on <=9B models, but expect ~2x the checkpoint size in RAM) and the Hugging
+# Face upload. All network traffic goes to together.xyz, huggingface.co,
+# github.com (model libraries) and mlc.ai (wheel index at build time).
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY train/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir --pre -U -f https://mlc.ai/wheels \
+        mlc-llm-nightly-cpu mlc-ai-nightly-cpu
+
+COPY train/tsa_train.py train/variants.json ./train/
+
+# Non-root; mounted volumes must be writable by uid 1000.
+RUN useradd -m -u 1000 trainer
+USER trainer
+
+# MODELS_DIR is the `sync` target: mount the volume the model server (Dockerfile.model) reads.
+ENV DATASET_OUT=/data/train/dataset \
+    TRAIN_DIR=/data/train \
+    TRAIN_OUT=/data/train/finetune \
+    HF_HOME=/data/train/finetune/hf-cache \
+    MODELS_DIR=/models
+
+ENTRYPOINT ["python", "train/tsa_train.py"]
+CMD ["--help"]

@@ -836,30 +836,49 @@ def diff_reference(ours: dict[str, Any], ref: dict[str, Any]) -> list[str]:
     return problems
 
 
-def config_for_convert(merged: Path, dest: Path) -> Path:
-    """Copy `config.json` with `dtype` forced to float16, for `convert_weight` only.
+def _limit_qwen35_export_to_embed() -> None:
+    """Trace only `embed` while converting Qwen3.5 weights.
 
-    The Qwen3.5 checkpoint declares bfloat16. This MLC nightly constructs
-    `nn.Parameter`s at that dtype and then segfaults in `tvm::ffi::ReprPrint`
-    while reading the tensor type back. `q4f16_1` stores float16 anyway, and
-    `quantize` switches the module to float16 before any weight is read.
-    `gen_config` keeps using the original file, so `mlc-chat-config.json` still
-    matches the reference (its `model_config.dtype` stays bfloat16).
+    `convert_weight` exports the module solely to learn parameter names and
+    shapes; the exporter collects those by walking the module. Tracing
+    `batch_prefill` builds the GatedDeltaNet kernel and `RNNState` constants,
+    and this MLC nightly segfaults in `tvm::ffi::ReprPrint` while doing that.
+    The prebuilt WASM already contains that kernel, so the weights do not
+    need it.
     """
-    cfg = read_json(merged / "config.json")
-    changed = False
-    text = cfg.get("text_config")
-    if isinstance(text, dict) and text.get("dtype") not in (None, "float16"):
-        text["dtype"] = "float16"
-        changed = True
-    if cfg.get("dtype") not in (None, "float16"):
-        cfg["dtype"] = "float16"
-        changed = True
-    if not changed:
-        return merged / "config.json"
-    write_json_atomic(dest, cfg)
-    log(f"convert config: dtype forced to float16 ({dest.name}); original config.json is unchanged")
-    return dest
+    from mlc_llm.model.qwen35.qwen35_model import Qwen35LMHeadModel
+    from tvm.relax.frontend import nn
+
+    def embed_only(self):
+        return nn.spec.ModuleSpec.from_raw({
+            "embed": {
+                "input_ids": nn.spec.Tensor(["seq_len"], "int32"),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
+            },
+        }, self)
+
+    Qwen35LMHeadModel.get_default_spec = embed_only  # type: ignore[method-assign]
+
+
+def convert_weights(merged: Path, mlc_out: Path, *, model_type: str, quantization: str, device: str) -> None:
+    """Run `convert_weight` in-process, with the Qwen3.5 export limited to `embed`."""
+    from mlc_llm.interface.convert_weight import convert_weight
+    from mlc_llm.model import MODELS
+    from mlc_llm.quantization import QUANTIZATION
+    from mlc_llm.support.auto_device import detect_device
+
+    if model_type.startswith("qwen3_5"):
+        _limit_qwen35_export_to_embed()
+        log("convert: tracing only embed(); the Qwen3.5 prefill graph segfaults in this MLC nightly")
+    convert_weight(
+        config=merged / "config.json",
+        quantization=QUANTIZATION[quantization],
+        model=MODELS[model_type],
+        device=detect_device(device),
+        source=merged,
+        source_format="huggingface-safetensor",
+        output=mlc_out,
+    )
 
 
 def cmd_convert(args: argparse.Namespace) -> None:
@@ -896,20 +915,8 @@ def cmd_convert(args: argparse.Namespace) -> None:
         shutil.rmtree(mlc_out)
     mlc_out.mkdir(parents=True)
 
-    # A config file outside the checkpoint dir, so --source must point at the
-    # weights explicitly (convert_weight otherwise looks next to the config).
-    convert_cfg = config_for_convert(merged, vdir / "convert.config.json")
-    convert_cmd = [
-        *mlc_llm, "convert_weight", str(convert_cfg),
-        "--quantization", quant,
-        "--model-type", str(ref["model_type"]),
-        "--device", args.device,
-        "--source", str(merged),
-        "--source-format", "huggingface-safetensor",
-        "--output", str(mlc_out),
-    ]
-    log("running: " + " ".join(convert_cmd))
-    subprocess.run(convert_cmd, check=True)
+    log(f"convert_weight {merged} -> {mlc_out} quantization={quant} device={args.device}")
+    convert_weights(merged, mlc_out, model_type=str(ref["model_type"]), quantization=quant, device=args.device)
 
     gen_cmd = [
         *mlc_llm, "gen_config", str(merged),

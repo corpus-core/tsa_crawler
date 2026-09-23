@@ -860,6 +860,55 @@ def _limit_qwen35_export_to_embed() -> None:
     Qwen35LMHeadModel.get_default_spec = embed_only  # type: ignore[method-assign]
 
 
+def _numpy_dtype_name(dtype: object) -> str:
+    """NumPy dtype string for a TVM dtype such as `T.float16`.
+
+    NumPy 2 rejects that object. Its `.dtype` is a `tvm_ffi` dtype (a `str`
+    subclass) whose repr is `dtype('float16')`, and `ndarray.astype` then
+    raises `Could not convert T.float16 to a NumPy dtype`.
+    """
+    if isinstance(dtype, str):
+        return str(dtype)
+    inner = getattr(dtype, "dtype", None)
+    if isinstance(inner, str):
+        return str(inner)
+    name = getattr(inner, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    text = str(dtype)
+    if text.startswith("T."):
+        return text[2:]
+    return text
+
+
+def _patch_qwen35_numpy_dtypes():
+    """Make Qwen3.5 loader casts use NumPy dtype strings.
+
+    The loader binds `dtype=mlc_param.dtype` through `functools.partial`.
+    Rewriting that keyword covers the fused QKV / MLP maps and the 1:1 maps.
+    Returns a function that restores `functools.partial`.
+    """
+    import functools
+
+    import mlc_llm.model.qwen35.qwen35_loader as loader
+
+    original = functools.partial
+
+    def partial(func, *args, **kwargs):
+        if "dtype" in kwargs:
+            kwargs["dtype"] = _numpy_dtype_name(kwargs["dtype"])
+        return original(func, *args, **kwargs)
+
+    functools.partial = partial  # type: ignore[method-assign]
+    loader.functools.partial = partial  # type: ignore[attr-defined]
+
+    def restore() -> None:
+        functools.partial = original  # type: ignore[method-assign]
+        loader.functools.partial = original  # type: ignore[attr-defined]
+
+    return restore
+
+
 def convert_weights(merged: Path, mlc_out: Path, *, model_type: str, quantization: str, device: str) -> None:
     """Run `convert_weight` in-process, with the Qwen3.5 export limited to `embed`."""
     from mlc_llm.interface.convert_weight import convert_weight
@@ -868,22 +917,29 @@ def convert_weights(merged: Path, mlc_out: Path, *, model_type: str, quantizatio
     from mlc_llm.support.auto_device import detect_device
     from mlc_llm.support.auto_weight import detect_weight
 
+    restore_dtypes = None
     if model_type.startswith("qwen3_5"):
         _limit_qwen35_export_to_embed()
+        restore_dtypes = _patch_qwen35_numpy_dtypes()
         log("convert: tracing only embed(); the Qwen3.5 prefill graph segfaults in this MLC nightly")
+        log("convert: casting TVM dtypes as NumPy strings; ndarray.astype rejects T.float16")
     # The loader wants the index file (`model.safetensors.index.json`), not the
     # directory. The CLI resolves that through detect_weight; do the same here.
     config = merged / "config.json"
     source, source_format = detect_weight(merged, config, "huggingface-safetensor")
-    convert_weight(
-        config=config,
-        quantization=QUANTIZATION[quantization],
-        model=MODELS[model_type],
-        device=detect_device(device),
-        source=source,
-        source_format=source_format,
-        output=mlc_out,
-    )
+    try:
+        convert_weight(
+            config=config,
+            quantization=QUANTIZATION[quantization],
+            model=MODELS[model_type],
+            device=detect_device(device),
+            source=source,
+            source_format=source_format,
+            output=mlc_out,
+        )
+    finally:
+        if restore_dtypes is not None:
+            restore_dtypes()
 
 
 def cmd_convert(args: argparse.Namespace) -> None:

@@ -881,6 +881,96 @@ def _numpy_dtype_name(dtype: object) -> str:
     return text
 
 
+def _group_quantize_array(
+    weight,
+    *,
+    group_size: int,
+    max_int: int,
+    num_elem_per_storage: int,
+    axis: int = -1,
+    output_transpose: bool = False,
+):
+    """Group-quantize a float weight the way MLC `q4f16_1` does.
+
+    This nightly's compiled quantize kernel segfaults, so the packing is done
+    here. Layout matches `GroupQuantize._quantize` / `pack_weight`: per group,
+    `scale = max(abs(w)) / max_int`, stored codes are `round(w / scale + max_int)`
+    clipped to `[0, 2 * max_int]`, and `num_elem_per_storage` codes are packed
+    into one `uint32` with the first element in the low bits.
+    """
+    import numpy as np
+
+    array = np.asarray(weight)
+    if axis < 0:
+        axis += array.ndim
+    if axis < 0 or axis >= array.ndim:
+        raise ValueError(f"quantize axis {axis} out of range for ndim {array.ndim}")
+    elem_bits = 32 // num_elem_per_storage
+    length = array.shape[axis]
+    pad = (-length) % group_size
+    if pad:
+        pad_width = [(0, 0)] * array.ndim
+        pad_width[axis] = (0, pad)
+        array = np.pad(array, pad_width)
+    grouped_shape = list(array.shape)
+    n_group = grouped_shape[axis] // group_size
+    grouped_shape[axis] = n_group
+    grouped_shape.insert(axis + 1, group_size)
+    grouped = array.reshape(grouped_shape).astype(np.float32, copy=False)
+    max_abs = np.max(np.abs(grouped), axis=axis + 1)
+    scale = (max_abs / np.float32(max_int)).astype(np.float16)
+    scale_b = np.expand_dims(scale.astype(np.float32), axis + 1)
+    nonzero = scale_b != 0
+    divided = np.zeros(grouped.shape, dtype=np.float32)
+    np.divide(grouped, scale_b, out=divided, where=nonzero)
+    codes = np.where(nonzero, np.rint(divided + np.float32(max_int)), np.float32(max_int))
+    codes = np.clip(codes, 0, max_int * 2).astype(np.uint32)
+    flat = codes.reshape(array.shape)
+    if flat.shape[axis] % num_elem_per_storage != 0:
+        raise ValueError(
+            f"axis {axis} length {flat.shape[axis]} is not divisible by {num_elem_per_storage}"
+        )
+    packed_shape = list(flat.shape)
+    n_storage = packed_shape[axis] // num_elem_per_storage
+    packed_shape[axis] = n_storage
+    packed_shape.insert(axis + 1, num_elem_per_storage)
+    pieces = flat.reshape(packed_shape)
+    shift_shape = [1] * pieces.ndim
+    shift_shape[axis + 1] = num_elem_per_storage
+    shifts = (np.arange(num_elem_per_storage, dtype=np.uint32) * np.uint32(elem_bits)).reshape(shift_shape)
+    packed = (pieces << shifts).sum(axis=axis + 1, dtype=np.uint32)
+    if output_transpose:
+        if packed.ndim != 2 or scale.ndim != 2:
+            raise ValueError("transpose of quantized weight requires 2D tensors")
+        packed = np.swapaxes(packed, 0, 1)
+        scale = np.swapaxes(scale, 0, 1)
+    return np.ascontiguousarray(packed), np.ascontiguousarray(scale)
+
+
+def _patch_qwen35_group_quant() -> None:
+    """Replace `GroupQuantize.quantize_weight` with the NumPy packer.
+
+    `compile_quantize_func` builds a Relax kernel and this MLC nightly
+    segfaults on the first call, including a 64x32 float16 input.
+    """
+    from mlc_llm.quantization.group_quantization import GroupQuantize
+    from tvm.runtime import tensor as as_tensor
+
+    def quantize_weight(self, weight, axis: int = -1, output_transpose: bool = False):
+        packed, scale = _group_quantize_array(
+            weight.numpy(),
+            group_size=self.group_size,
+            max_int=self.max_int_value,
+            num_elem_per_storage=self.num_elem_per_storage,
+            axis=axis,
+            output_transpose=output_transpose,
+        )
+        device = weight.device
+        return [as_tensor(packed, device=device), as_tensor(scale, device=device)]
+
+    GroupQuantize.quantize_weight = quantize_weight  # type: ignore[method-assign]
+
+
 def _patch_qwen35_numpy_dtypes():
     """Make Qwen3.5 loader casts use NumPy dtype strings.
 
@@ -921,8 +1011,10 @@ def convert_weights(merged: Path, mlc_out: Path, *, model_type: str, quantizatio
     if model_type.startswith("qwen3_5"):
         _limit_qwen35_export_to_embed()
         restore_dtypes = _patch_qwen35_numpy_dtypes()
+        _patch_qwen35_group_quant()
         log("convert: tracing only embed(); the Qwen3.5 prefill graph segfaults in this MLC nightly")
         log("convert: casting TVM dtypes as NumPy strings; ndarray.astype rejects T.float16")
+        log("convert: group quantization in NumPy; the MLC quantize kernel segfaults on this nightly")
     # The loader wants the index file (`model.safetensors.index.json`), not the
     # directory. The CLI resolves that through detect_weight; do the same here.
     config = merged / "config.json"
@@ -1130,24 +1222,43 @@ def cmd_serve(args: argparse.Namespace) -> None:
             log("stopped")
 
 
+def _sync_local_tree(src: Path, dst: Path, *, dry_run: bool) -> None:
+    """Copy `src` onto `dst`, then delete files in `dst` that are not in `src`."""
+    files = [path for path in src.rglob("*") if path.is_file()]
+    rels = {path.relative_to(src) for path in files}
+    if dry_run:
+        log(f"would copy {len(rels)} files {src} -> {dst}")
+        return
+    for rel in rels:
+        target = dst / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src / rel, target)
+    if dst.is_dir():
+        for path in dst.rglob("*"):
+            if path.is_file() and path.relative_to(dst) not in rels:
+                path.unlink()
+        for path in sorted((p for p in dst.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+            if not any(path.iterdir()):
+                path.rmdir()
+
+
 def sync_weights(variant: dict[str, Any], dest: str, version: str | None, *, force: bool, dry_run: bool, exists_ok: bool) -> None:
-    """rsync the MLC weights to `<dest>/<model_id>/<weights_version>/`.
+    """Copy the MLC weights to `<dest>/<model_id>/<weights_version>/`.
 
     That layout is what `docker/model/nginx.conf` serves and what the
     explainer's model record expects. `dest` is a local directory (e.g. the
-    mounted `tsa_models` volume) or `host:/path`. An existing version directory
-    is never overwritten in place unless `force`, because browsers cache the
-    shards by URL and would mix old and new files; with `exists_ok` (pipeline)
-    that case is a logged skip instead of an error.
+    mounted `tsa_models` volume) or `host:/path`. A local dest is copied in
+    process, because the train image does not ship `rsync`. A remote dest
+    still uses `rsync`. An existing version directory is never overwritten in
+    place unless `force`, because browsers cache the shards by URL and would
+    mix old and new files; with `exists_ok` (pipeline) that case is a logged
+    skip instead of an error.
     """
     state = run_state(variant)
     mlc_dir = Path(state.get("mlc_dir") or (variant_dir(variant) / "mlc"))
     if not (mlc_dir / "mlc-chat-config.json").is_file():
         die(f"no MLC weights at {mlc_dir}; run `convert` first")
     version = version or variant.get("weights_version") or "v1"
-    rsync = shutil.which("rsync")
-    if not rsync:
-        die("`rsync` not found on PATH")
     dest = dest.rstrip("/")
     target = f"{dest}/{variant['model_id']}/{version}/"
     remote = ":" in dest
@@ -1155,22 +1266,27 @@ def sync_weights(variant: dict[str, Any], dest: str, version: str | None, *, for
         host, _, remote_path = dest.partition(":")
         probe = ["ssh", host, f"test -e {remote_path}/{variant['model_id']}/{version}/mlc-chat-config.json"]
         exists = subprocess.run(probe, check=False).returncode == 0
-        mkdir = ["ssh", host, f"mkdir -p {remote_path}/{variant['model_id']}/{version}"]
     else:
         exists = (Path(dest) / variant["model_id"] / version / "mlc-chat-config.json").is_file()
-        mkdir = ["mkdir", "-p", f"{dest}/{variant['model_id']}/{version}"]
     if exists and not force:
         if exists_ok:
             log(f"{target} already holds weights; skipping (bump weights_version for new weights)")
             return
         die(f"{target} already holds weights; bump weights_version in variants.json or pass --force")
-    subprocess.run(mkdir, check=True)
-    # `--progress` rather than `--info=progress2`: macOS ships openrsync / rsync 2.6.
-    cmd = [rsync, "-av", "--delete", "--progress", f"{mlc_dir}/", target]
-    if dry_run:
-        cmd.insert(1, "--dry-run")
-    log("running: " + " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    if not remote:
+        log(f"copying {mlc_dir} -> {target}")
+        _sync_local_tree(mlc_dir, Path(target), dry_run=dry_run)
+    else:
+        rsync = shutil.which("rsync")
+        if not rsync:
+            die("`rsync` not found on PATH (needed for a remote sync dest)")
+        subprocess.run(["ssh", host, f"mkdir -p {remote_path}/{variant['model_id']}/{version}"], check=True)
+        # `--progress` rather than `--info=progress2`: macOS ships openrsync / rsync 2.6.
+        cmd = [rsync, "-av", "--delete", "--progress", f"{mlc_dir}/", target]
+        if dry_run:
+            cmd.insert(1, "--dry-run")
+        log("running: " + " ".join(cmd))
+        subprocess.run(cmd, check=True)
     if not dry_run:
         state["synced"] = {"dest": target, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         save_run_state(variant, state)

@@ -866,17 +866,22 @@ def convert_weights(merged: Path, mlc_out: Path, *, model_type: str, quantizatio
     from mlc_llm.model import MODELS
     from mlc_llm.quantization import QUANTIZATION
     from mlc_llm.support.auto_device import detect_device
+    from mlc_llm.support.auto_weight import detect_weight
 
     if model_type.startswith("qwen3_5"):
         _limit_qwen35_export_to_embed()
         log("convert: tracing only embed(); the Qwen3.5 prefill graph segfaults in this MLC nightly")
+    # The loader wants the index file (`model.safetensors.index.json`), not the
+    # directory. The CLI resolves that through detect_weight; do the same here.
+    config = merged / "config.json"
+    source, source_format = detect_weight(merged, config, "huggingface-safetensor")
     convert_weight(
-        config=merged / "config.json",
+        config=config,
         quantization=QUANTIZATION[quantization],
         model=MODELS[model_type],
         device=detect_device(device),
-        source=merged,
-        source_format="huggingface-safetensor",
+        source=source,
+        source_format=source_format,
         output=mlc_out,
     )
 

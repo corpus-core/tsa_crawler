@@ -12,3 +12,6 @@ tokenizers>=0.20
 #   pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly-cpu mlc-ai-nightly-cpu
 # (CPU wheels are enough for convert_weight / gen_config; no GPU needed.)
 # The wheel has no `mlc_llm` console script; invoke `python -m mlc_llm`.
+# `python -m mlc_llm` imports mlc_llm.serve, which imports psutil at module
+# level, but the wheel does not declare that dependency.
+psutil>=5.9

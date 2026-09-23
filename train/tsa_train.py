@@ -848,9 +848,11 @@ def cmd_convert(args: argparse.Namespace) -> None:
         log(f"MLC weights already at {mlc_out}; pass --force to rebuild")
         return
 
-    mlc_llm = shutil.which("mlc_llm")
-    if not mlc_llm:
-        die("`mlc_llm` not found on PATH; see train/requirements.txt for the nightly wheel install")
+    # The nightly wheel ships no console script; `python -m mlc_llm` is the entry point.
+    import importlib.util
+    if importlib.util.find_spec("mlc_llm") is None:
+        die("python package 'mlc_llm' is missing; see train/requirements.txt for the nightly wheel install")
+    mlc_llm = [sys.executable, "-m", "mlc_llm"]
 
     ref = fetch_reference_config(variant)
     quant = variant["quantization"]
@@ -869,7 +871,7 @@ def cmd_convert(args: argparse.Namespace) -> None:
     mlc_out.mkdir(parents=True)
 
     convert_cmd = [
-        mlc_llm, "convert_weight", str(merged),
+        *mlc_llm, "convert_weight", str(merged),
         "--quantization", quant,
         "--model-type", str(ref["model_type"]),
         "--device", args.device,
@@ -879,7 +881,7 @@ def cmd_convert(args: argparse.Namespace) -> None:
     subprocess.run(convert_cmd, check=True)
 
     gen_cmd = [
-        mlc_llm, "gen_config", str(merged),
+        *mlc_llm, "gen_config", str(merged),
         "--quantization", quant,
         "--model-type", str(ref["model_type"]),
         "--conv-template", conv_template,

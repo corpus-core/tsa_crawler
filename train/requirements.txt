@@ -11,3 +11,4 @@ tokenizers>=0.20
 # nightly wheels from https://mlc.ai/wheels. Install it separately, e.g.
 #   pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly-cpu mlc-ai-nightly-cpu
 # (CPU wheels are enough for convert_weight / gen_config; no GPU needed.)
+# The wheel has no `mlc_llm` console script; invoke `python -m mlc_llm`.

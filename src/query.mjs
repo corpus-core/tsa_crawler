@@ -50,7 +50,7 @@ Options:
   -R                  Delete only _response.json and _validation.json of the
                       matching txs so gen-responses / validate-responses
                       regenerate them (prompt, sim, trace stay); e.g. -v -R
-  -h, --help          Show this help
+  -h, --help          Show this help-message
 `;
 
 const BUCKET_KEY_RE = /^([0-9a-f]{64})_([0-9a-f]{8}|fallback)$/;

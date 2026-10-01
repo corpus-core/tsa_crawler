@@ -72,7 +72,7 @@ Forward-streaming sampler. Every `POLL_MS` it checks for a new block, selects co
 - Restart-safe: cursor in `.state.json`, bucket counts reconstructed from the filesystem.
 - Window-aware: a full node only keeps ~128 blocks of state. If lag exceeds `MAX_LAG`, older blocks are skipped rather than traced against missing state.
 - Adaptive tracing: one selected tx → `debug_traceTransaction`; two or more → `debug_traceBlockByNumber` (the block is executed once).
-- Each saved file has `meta`, optional `receipt`, `trace` (`keccak` / `sload` / `sstore` / `call` / `output`), and an `accessList` with proxy implementation resolution.
+- Each saved file has `meta`, optional `receipt`, `trace` (`keccak` / `sload` / `sstore` / `jumpdest` / `call` / `output`), and an `accessList` with proxy implementation resolution. `jumpdest` records each executed JUMPDEST program counter once per code address (empty on traces collected before this field existed).
 
 Needs a Geth node with the `eth` and `debug` namespaces.
 

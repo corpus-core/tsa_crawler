@@ -26,6 +26,7 @@ import {
     simPathForPrompt,
     loadSimText,
     hasTraceCall,
+    hasSimPositions,
     responsePathForPrompt,
     validationPathForPrompt,
     readResponse,
@@ -99,6 +100,8 @@ describe('parseArgs', () => {
         assert.equal(parseArgs(['-r']).random, true);
         assert.equal(parseArgs(['-t', '0']).hasCall, false);
         assert.equal(parseArgs(['-t', '1']).hasCall, true);
+        assert.equal(parseArgs(['-P', '0']).hasPositions, false);
+        assert.equal(parseArgs(['-P', '1']).hasPositions, true);
         assert.equal(parseArgs(['-s']).sim, true);
         assert.deepEqual(parseArgs(['-x']).deleteTrace, true);
         assert.deepEqual(parseArgs(['-X']), {
@@ -170,6 +173,8 @@ describe('parseArgs', () => {
         assert.throws(() => parseArgs(['-m', 'approve']), /method id/);
         assert.throws(() => parseArgs(['-t']), /requires 0 or 1/);
         assert.throws(() => parseArgs(['-t', '2']), /requires 0 or 1/);
+        assert.throws(() => parseArgs(['-P']), /requires 0 or 1/);
+        assert.throws(() => parseArgs(['-P', '2']), /requires 0 or 1/);
         assert.throws(() => parseArgs(['-e']), /requires a value/);
         assert.throws(() => parseArgs(['-e', 'logs']), /unknown section/);
         assert.throws(() => parseArgs(['-e', 'tx', '-E', 'tx,state']), /same section/);
@@ -216,6 +221,16 @@ describe('hasTraceCall', () => {
         assert.equal(hasTraceCall({ trace: { call: null } }), false);
         assert.equal(hasTraceCall({}), false);
         assert.equal(hasTraceCall(null), false);
+    });
+});
+
+describe('hasSimPositions', () => {
+    it('detects a non-empty .positions list on sim JSON', () => {
+        assert.equal(hasSimPositions({ positions: [{ address: '0xaa', pcs: ['0x1'] }] }), true);
+        assert.equal(hasSimPositions({ positions: [] }), false);
+        assert.equal(hasSimPositions({}), false);
+        assert.equal(hasSimPositions({ positions: 'nope' }), false);
+        assert.equal(hasSimPositions(null), false);
     });
 });
 
@@ -693,6 +708,32 @@ describe('visitMatchingPrompts', () => {
         const present = [];
         visitMatchingPrompts(root, { hasCall: true }, (hit) => present.push(hit.relPath));
         assert.deepEqual(present, [withCallPrompt]);
+    });
+
+    it('filters sim results by .positions (-P 0/1)', () => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), 'query-'));
+        const withPositionsPrompt = writePrompt(root, TX_A, 'ok');
+        fs.writeFileSync(
+            simPathForPrompt(path.join(root, withPositionsPrompt)),
+            JSON.stringify({ positions: [{ address: '0xaa', pcs: ['0x1'] }] }),
+        );
+        const emptyPositionsPrompt = writePrompt(root, TX_B, 'ok');
+        fs.writeFileSync(
+            simPathForPrompt(path.join(root, emptyPositionsPrompt)),
+            JSON.stringify({ positions: [] }),
+        );
+        const noSimPrompt = writePrompt(root, TX_C, 'ok');
+
+        const withPositions = [];
+        visitMatchingPrompts(root, { hasPositions: true }, (hit) => withPositions.push(hit.relPath));
+        assert.deepEqual(withPositions, [withPositionsPrompt]);
+
+        const withoutPositions = [];
+        visitMatchingPrompts(root, { hasPositions: false }, (hit) => withoutPositions.push(hit.relPath));
+        assert.deepEqual(
+            new Set(withoutPositions),
+            new Set([emptyPositionsPrompt, noSimPrompt]),
+        );
     });
 });
 

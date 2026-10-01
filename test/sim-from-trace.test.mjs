@@ -73,6 +73,10 @@ describe('traceToSimulation', () => {
         assert.equal(sim.trace[0].subtraces, '0x1');
         assert.equal(sim.accessList[0].codeHash.startsWith('0xd0a0'), true);
         assert.equal(sim.accessList[0].implementation, undefined);
+        // Written slot is already covered by stateChanges; the explainer's
+        // resolveAllReads skips it, so sim-from-trace must not emit it as a read.
+        assert.equal(sim.accessList[0].storage, undefined);
+        assert.equal(sim.positions, undefined);
     });
 
     it('synthesizes a top-level CALL when the tracer left no call tree', () => {
@@ -85,6 +89,87 @@ describe('traceToSimulation', () => {
         assert.equal(sim.trace[0].type, 'CALL');
         assert.equal(sim.trace[0].output, '0xdead');
         assert.deepEqual(sim.trace[0].traceAddress, []);
+        assert.equal(sim.positions, undefined);
+    });
+
+    it('attaches read-only storage entries with slotSource and omits written slots', () => {
+        const slotWrite = '0x0242ace4aee0b852ee20a6dadbb8dd2f699da3c4f840b14304b45ac861c0b6c5';
+        const slotRead = '0xa08dc240ddc2d3b981baedd3800a57d375010fcc8b286eb8129362de427289d8';
+        const preimage = '0x' + FROM.slice(2).padStart(64, '0') + '3'.padStart(64, '0');
+        const readValue = '0x' + '0'.repeat(63) + '7';
+        const sim = traceToSimulation({
+            meta: { from: FROM, to: TO, value: '0x0', input: '0x095ea7b3' },
+            receipt: { status: '0x1', gasUsed: '0x1', logs: [] },
+            trace: {
+                output: '0x',
+                keccak: [{ addr: TO, input: preimage, hash: slotRead }],
+                // First SLOAD wins for pre-state; a later SLOAD of the same slot
+                // must not overwrite the recorded value.
+                sload: [
+                    { addr: TO, slot: slotRead, value: readValue },
+                    { addr: TO, slot: slotRead, value: '0x' + '0'.repeat(63) + '9' },
+                    { addr: TO, slot: slotWrite, value: '0x' + '0'.repeat(64) },
+                ],
+                sstore: [{ addr: TO, slot: slotWrite, value: '0x' + '0'.repeat(63) + '1' }],
+            },
+            // storageKeys are given in reverse order to prove the output
+            // follows storageKeys, not SLOAD insertion order.
+            accessList: [{
+                address: TO,
+                storageKeys: [slotWrite, slotRead],
+                codeHash: '0xd0a06b12ac47863b5c7be4185c2deaad1c61557033f56c7d4ea74429cbb25e23',
+            }],
+        });
+
+        const storage = sim.accessList[0].storage;
+        assert.equal(Array.isArray(storage), true);
+        assert.equal(storage.length, 1);
+        assert.equal(storage[0].slot, slotRead);
+        assert.equal(storage[0].value, readValue);
+        assert.equal(storage[0].slotSource, preimage);
+    });
+
+    it('emits deduped, sorted positions and keeps the implementation code address', () => {
+        const IMPL = '0x1111111111111111111111111111111111111111';
+        const sim = traceToSimulation({
+            meta: { from: FROM, to: TO, value: '0x0', input: '0x' },
+            receipt: { status: '0x1', gasUsed: '0x1', logs: [] },
+            trace: {
+                output: '0x',
+                keccak: [],
+                sload: [],
+                sstore: [],
+                jumpdest: [
+                    { addr: TO, pcs: ['0x10', '0x1', '0x1', '0xa'] },
+                    { addr: IMPL, pcs: ['0x20'] },
+                ],
+            },
+        });
+
+        assert.deepEqual(sim.positions, [
+            { address: TO.toLowerCase(), pcs: ['0x1', '0xa', '0x10'] },
+            { address: IMPL.toLowerCase(), pcs: ['0x20'] },
+        ]);
+    });
+
+    it('tolerates numeric PCs and drops empty jumpdest entries', () => {
+        const sim = traceToSimulation({
+            meta: { from: FROM, to: TO, value: '0x0', input: '0x' },
+            receipt: { status: '0x1', gasUsed: '0x1', logs: [] },
+            trace: {
+                output: '0x',
+                keccak: [],
+                sload: [],
+                sstore: [],
+                jumpdest: [
+                    { addr: TO, pcs: [5, 1, 5, 3] },
+                    { addr: '0x2222222222222222222222222222222222222222', pcs: [] },
+                ],
+            },
+        });
+
+        assert.equal(sim.positions.length, 1);
+        assert.deepEqual(sim.positions[0], { address: TO.toLowerCase(), pcs: ['0x1', '0x3', '0x5'] });
     });
 });
 

@@ -35,6 +35,9 @@ Options:
                       (deterministic verdict != pass, or judge != good)
   -t <0|1>            Keep txs whose collector {txhash}.json has (.trace.call)
                       (1) or does not (0)
+  -P <0|1>            Keep txs whose sibling _sim.json has a non-empty
+                      .positions list (1) or does not (0). Missing _sim.json
+                      counts as "no positions".
   -e <sections>       Keep files whose listed sections are resolved
                       (comma-separated: tx,events,state,call,code)
   -E <sections>       Keep files whose listed sections are not resolved
@@ -229,7 +232,7 @@ export function parseSectionList(val, flag) {
 
 /**
  * @param {string[]} argv
- * @return {{ q: Array<{ term: string, section?: string }>, c: string[], m: string[], e: string[], E: string[], min?: number, max?: number, limit?: number, offset?: number, random: boolean, details: boolean, sim: boolean, validationProblems: boolean, stats: boolean, hasCall?: boolean, deleteTrace: boolean, deleteSiblings: boolean, deleteResponses: boolean, help: boolean }}
+ * @return {{ q: Array<{ term: string, section?: string }>, c: string[], m: string[], e: string[], E: string[], min?: number, max?: number, limit?: number, offset?: number, random: boolean, details: boolean, sim: boolean, validationProblems: boolean, stats: boolean, hasCall?: boolean, hasPositions?: boolean, deleteTrace: boolean, deleteSiblings: boolean, deleteResponses: boolean, help: boolean }}
  */
 export function parseArgs(argv) {
     const filters = {
@@ -283,6 +286,14 @@ export function parseArgs(argv) {
                 throw new Error('-t requires 0 or 1');
             }
             filters.hasCall = val === '1';
+            continue;
+        }
+        if (a === '-P') {
+            const val = argv[++i];
+            if (val !== '0' && val !== '1') {
+                throw new Error('-P requires 0 or 1');
+            }
+            filters.hasPositions = val === '1';
             continue;
         }
         if (a === '-e' || a === '-E') {
@@ -555,6 +566,17 @@ export function readValidation(promptAbsPath, onWarn) {
 }
 
 /**
+ * Parsed sibling `_sim.json`, or `null` when missing/invalid.
+ *
+ * @param {string} promptAbsPath
+ * @param {(msg: string) => void} [onWarn]
+ * @return {object | null}
+ */
+export function readSim(promptAbsPath, onWarn) {
+    return readSiblingJson(simPathForPrompt(promptAbsPath), onWarn);
+}
+
+/**
  * True when at least one style check reports a problem: the deterministic
  * verdict is not `pass`, or a judge ran and did not return `good`.
  * A missing validation file has no known problems (returns `false`).
@@ -589,6 +611,20 @@ export function hasTraceCall(parsed) {
         && parsed.trace != null
         && typeof parsed.trace === 'object'
         && parsed.trace.call != null;
+}
+
+/**
+ * True when a parsed `_sim.json` carries a non-empty `positions` list
+ * (JUMPDEST coverage from the collector).
+ *
+ * @param {unknown} parsed
+ * @return {boolean}
+ */
+export function hasSimPositions(parsed) {
+    return parsed != null
+        && typeof parsed === 'object'
+        && Array.isArray(parsed.positions)
+        && parsed.positions.length > 0;
 }
 
 /**
@@ -912,6 +948,7 @@ export function pageHits(hits, { random = false, offset = 0, limit, rng = Math.r
  */
 function forEachMatching(root, filters, onHit, onWarn) {
     const wantCall = filters.hasCall;
+    const wantPositions = filters.hasPositions;
     const requirePrompt = needsUserPrompt(filters) || wantCall === undefined;
     let scanned = 0;
     let matched = 0;
@@ -945,6 +982,14 @@ function forEachMatching(root, filters, onHit, onWarn) {
                     }
                 }
                 if (hasTraceCall(parsed) !== wantCall) continue;
+            }
+
+            if (wantPositions !== undefined) {
+                // Mirrors `-t`: missing `_sim.json` (or missing prompt sibling,
+                // so no sim-path to try) counts as "no positions" and matches
+                // `-P 0`.
+                const parsedSim = promptAbs ? readSim(promptAbs, onWarn) : null;
+                if (hasSimPositions(parsedSim) !== wantPositions) continue;
             }
 
             if (filters.validationProblems) {

@@ -38,7 +38,7 @@ const EMPTY_CODE_HASH = '0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad
 // keccak / sload / sstore plus a Geth call_tracer_legacy-style call tree and
 // ctx.output (return / revert data). ES5; uses Geth JS builtins.
 const TRACER = `{
-  keccak: [], sload: [], sstore: [], pending: null,
+  keccak: [], sload: [], sstore: [], jumpdest: [], jumpdestByAddr: {}, pending: null,
   callstack: [{}], descended: false,
   b2h: function(b){ return b < 0x10 ? '0'+b.toString(16) : b.toString(16); },
   a2h: function(arr){ var s=''; for (var i=0;i<arr.length;i++) s+=this.b2h(arr[i]); return s; },
@@ -141,6 +141,33 @@ const TRACER = `{
       if (parent.calls === undefined) parent.calls = [];
       parent.calls.push(finished);
     }
+    // JUMPDEST tracking: after any pop so 'jFrame' is the code frame that
+    // actually ran this opcode. 'to' is the code address (implementation on
+    // DELEGATECALL / CALLCODE). CREATE/CREATE2 run init code, not deployed
+    // runtime -- the source map does not apply, so skip them.
+    if (opNum === 0x5b) {
+      var pc = log.getPC();
+      if (pc < 65536) {
+        var jFrame = this.callstack[this.callstack.length - 1];
+        var jType = jFrame.type;
+        if (jType != 'CREATE' && jType != 'CREATE2') {
+          var codeAddr = jFrame.to;
+          if (!codeAddr) codeAddr = '0x' + this.a2h(log.contract.getAddress());
+          codeAddr = codeAddr.toLowerCase();
+          var jIdx = this.jumpdestByAddr[codeAddr];
+          if (jIdx === undefined) {
+            jIdx = this.jumpdest.length;
+            this.jumpdestByAddr[codeAddr] = jIdx;
+            this.jumpdest.push({ addr: codeAddr, seen: {}, pcs: [] });
+          }
+          var jSet = this.jumpdest[jIdx];
+          if (!jSet.seen[pc]) {
+            jSet.seen[pc] = true;
+            jSet.pcs.push(pc);
+          }
+        }
+      }
+    }
   },
   fault: function(log, db){
     this.pending = null;
@@ -183,6 +210,17 @@ const TRACER = `{
     else if (ctx.error !== undefined) root.error = ctx.error;
     var out = { keccak: this.keccak, sload: this.sload, sstore: this.sstore, output: toHex(ctx.output), call: this.finalize(root) };
     if (root.error !== undefined) out.error = root.error;
+    if (this.jumpdest.length > 0) {
+      var jd = [];
+      for (var ji = 0; ji < this.jumpdest.length; ji++) {
+        var jSet = this.jumpdest[ji];
+        var jPcs = jSet.pcs.slice().sort(function(a, b){ return a - b; });
+        var jPcsHex = [];
+        for (var jj = 0; jj < jPcs.length; jj++) jPcsHex.push('0x' + jPcs[jj].toString(16));
+        jd.push({ addr: jSet.addr, pcs: jPcsHex });
+      }
+      out.jumpdest = jd;
+    }
     return out;
   }
 }`;
@@ -366,6 +404,7 @@ async function processBlock(n) {
       sload: trace.sload || [],
       sstore: trace.sstore || [],
     };
+    if (Array.isArray(trace.jumpdest) && trace.jumpdest.length) savedTrace.jumpdest = trace.jumpdest;
     if (trace.output !== undefined) savedTrace.output = trace.output;
     if (trace.error !== undefined) savedTrace.error = trace.error;
     if (trace.call !== undefined) savedTrace.call = trace.call;

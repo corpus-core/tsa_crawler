@@ -187,6 +187,107 @@ function findSlotSource(keccak, slot, addr) {
     return preferred.input;
 }
 
+/**
+ * Index SLOAD values (first-seen pre-state wins) and SSTORE slot keys
+ * (lowercase `addr:slot`). The explainer intentionally shows written slots
+ * only in `stateChanges`, so writes are collected only to subtract them from
+ * reads.
+ *
+ * @param {Array<{addr:string, slot:string, value?:string}>} sload
+ * @param {Array<{addr:string, slot:string, value?:string}>} sstore
+ * @return {{firstSload: Map<string,string>, written: Set<string>}}
+ */
+function indexSloadReads(sload, sstore) {
+    const firstSload = new Map();
+    for (const s of sload || []) {
+        if (!s || !s.addr || s.slot == null || s.value == null) continue;
+        const slot = pad32(s.slot);
+        const value = pad32(s.value);
+        if (!slot || !value) continue;
+        const key = s.addr.toLowerCase() + ':' + slot;
+        if (!firstSload.has(key)) firstSload.set(key, value);
+    }
+    const written = new Set();
+    for (const s of sstore || []) {
+        if (!s || !s.addr || s.slot == null) continue;
+        const slot = pad32(s.slot);
+        if (!slot) continue;
+        written.add(s.addr.toLowerCase() + ':' + slot);
+    }
+    return { firstSload, written };
+}
+
+/**
+ * Attach `storage` reads (`{ slot, value, slotSource? }`) to each access-list
+ * entry. Slots that were also written stay out — those are already in
+ * `stateChanges`, and the explainer's `resolveAllReads` would discard them.
+ * The `storage` order follows `storageKeys`.
+ *
+ * @param {Array<object>|undefined} accessList  stripped list, mutated in place
+ * @param {Array<object>|undefined} sload
+ * @param {Array<object>|undefined} sstore
+ * @param {Array<object>|undefined} keccak
+ */
+function attachAccessReads(accessList, sload, sstore, keccak) {
+    if (!accessList || !accessList.length) return;
+    const { firstSload, written } = indexSloadReads(sload, sstore);
+    if (!firstSload.size) return;
+    for (const entry of accessList) {
+        const addr = (entry && entry.address ? String(entry.address) : '').toLowerCase();
+        if (!addr) continue;
+        const storage = [];
+        for (const slot of entry.storageKeys || []) {
+            const key = addr + ':' + slot;
+            if (written.has(key)) continue;
+            const value = firstSload.get(key);
+            if (!value) continue;
+            const read = { slot, value };
+            const src = findSlotSource(keccak, slot, addr);
+            if (src) read.slotSource = src;
+            storage.push(read);
+        }
+        if (storage.length) entry.storage = storage;
+    }
+}
+
+/**
+ * Build `SimulationResult.positions` from the collector's `jumpdest` entries.
+ * PCs are deduplicated per address, sorted ascending, and rendered as hex
+ * quantities (`0x1a`). Entries without PCs are dropped.
+ *
+ * @param {Array<{addr:string, pcs:Array<number|string>}>|undefined} jumpdest
+ * @return {Array<{address:string, pcs:string[]}>|undefined}
+ */
+function buildPositions(jumpdest) {
+    if (!Array.isArray(jumpdest) || !jumpdest.length) return undefined;
+    const out = [];
+    for (const entry of jumpdest) {
+        if (!entry || !entry.addr || !Array.isArray(entry.pcs)) continue;
+        const seen = new Set();
+        const pcs = [];
+        for (const raw of entry.pcs) {
+            let n;
+            if (typeof raw === 'number' && Number.isFinite(raw)) n = raw;
+            else if (typeof raw === 'string' && raw.length > 0) {
+                const trimmed = raw.trim();
+                n = trimmed.startsWith('0x') || trimmed.startsWith('0X')
+                    ? Number.parseInt(trimmed.slice(2), 16)
+                    : Number.parseInt(trimmed, 10);
+            } else continue;
+            if (!Number.isFinite(n) || n < 0 || seen.has(n)) continue;
+            seen.add(n);
+            pcs.push(n);
+        }
+        if (!pcs.length) continue;
+        pcs.sort((a, b) => a - b);
+        out.push({
+            address: String(entry.addr).toLowerCase(),
+            pcs: pcs.map((n) => '0x' + n.toString(16)),
+        });
+    }
+    return out.length ? out : undefined;
+}
+
 function buildStateChanges(sload, sstore, keccak) {
     const firstSload = new Map();
     for (const s of sload || []) {
@@ -295,7 +396,12 @@ export function traceToSimulation(file, extra) {
     if (simTrace) result.trace = simTrace;
     const stateChanges = buildStateChanges(trace.sload, trace.sstore, trace.keccak);
     if (stateChanges) result.stateChanges = stateChanges;
-    if (accessList) result.accessList = accessList;
+    if (accessList) {
+        attachAccessReads(accessList, trace.sload, trace.sstore, trace.keccak);
+        result.accessList = accessList;
+    }
+    const positions = buildPositions(trace.jumpdest);
+    if (positions) result.positions = positions;
     return result;
 }
 

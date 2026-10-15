@@ -206,7 +206,7 @@ DATA_DIR=./traces STAGES=gen,validate,export npm run build-dataset
 
 `dedup` or `export` failing stops the run. A teacher or judge call that fails after retries is logged and the other stages still run; the process then exits 1.
 
-The deployment that actually runs is `devops/ccmainnet3/mainnet_tsa_build` (`dc --profile build run --rm mainnet_tsa_build`). `docker-compose.yml` in this repo is the reference copy of that service.
+The deployment that actually runs is `devops/ccmainnet3` on ccmainnet3. Collector and prepare stay up; dedup, teacher, export, training, and weight sync are one-shot `dc --profile … run` commands. The sequence and the exact commands are in [SERVER.md](SERVER.md). `docker-compose.yml` in this repo is the reference copy of those services.
 
 ---
 
@@ -491,7 +491,7 @@ docker compose --profile gen-responses run --rm gen-responses
 docker compose --profile validate-responses run --rm -e JUDGE_SAMPLE_PCT=0 validate-responses
 ```
 
-`docker-compose.yml` here is a reference (host paths `/srv/trace-data`). The compose files that deploy are `devops/ccmainnet3/mainnet_tsa_{crawler,prepare,build}/docker-compose.override.yml`: traces and the keep-set are separate named volumes, and `DEEPSEEK_API_KEY` comes from `ccmainnet3/.env.local` on the host. Collector, prepare, and dedup must **not** share a `PROM_FILE` (`build-dataset` writes the dedup textfile). `DEEPSEEK_API_KEY` is required for the `build-dataset`, `gen-responses`, and `validate-responses` profiles; compose fails loudly if it is unset.
+`docker-compose.yml` here is a reference (host paths `/srv/trace-data`). The compose files that deploy are under `devops/ccmainnet3/` (`mainnet_tsa_{crawler,prepare,build,train}`, `tsa_model`, `tsa_traces`): traces and the keep-set are separate named volumes, and `DEEPSEEK_API_KEY` comes from `ccmainnet3/.env.local` on the host. On that host the shell function `dc` wires the overrides; the commands are in [SERVER.md](SERVER.md). Collector, prepare, and dedup must **not** share a `PROM_FILE` (`build-dataset` writes the dedup textfile). `DEEPSEEK_API_KEY` is required for the `build-dataset`, `gen-responses`, and `validate-responses` profiles; compose fails loudly if it is unset.
 
 ---
 
